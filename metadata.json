@@ -1,0 +1,8 @@
+{
+  "name": "Map Illuminator",
+  "description": "An interactive map of China that lights up cities based on natural language requests.",
+  "requestFramePermissions": [
+    "microphone"
+  ],
+  "majorCapabilities": []
+}
