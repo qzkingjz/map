@@ -2,7 +2,6 @@ import { useState } from 'react';
 import { motion } from 'motion/react';
 import {
   ArrowDownRight,
-  Building2,
   FileText,
   Globe2,
   Landmark,
@@ -10,6 +9,7 @@ import {
 } from 'lucide-react';
 import AiMapExperience from './components/AiMapExperience';
 import QuanzhouExhibitMap, { MigrationPoint } from './components/QuanzhouExhibitMap';
+import heritageNanyangImage from './assets/heritage-nanyang.png';
 
 const migrationPoints: MigrationPoint[] = [
   {
@@ -265,10 +265,11 @@ export default function App() {
         </div>
 
         <div className="qz-heritage-layout">
-          <div className="qz-building-figure" aria-hidden="true">
-            <Building2 />
-            <span />
-          </div>
+          <img
+            className="qz-building-figure"
+            src={heritageNanyangImage}
+            alt="泉州番仔楼与南洋回流意象"
+          />
           <div className="qz-heritage-table">
             {heritageZones.map(([zone, count, desc]) => (
               <div key={zone}>

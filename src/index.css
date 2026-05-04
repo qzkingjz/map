@@ -606,34 +606,14 @@ body {
 }
 
 .qz-building-figure {
-  position: relative;
+  width: 100%;
+  height: 440px;
+  object-fit: cover;
+  object-position: 34% center;
   min-height: 440px;
-  display: grid;
-  place-items: center;
-  overflow: hidden;
+  display: block;
   border-radius: 8px;
-  background:
-    linear-gradient(90deg, rgba(127, 38, 30, 0.14) 1px, transparent 1px),
-    linear-gradient(0deg, rgba(127, 38, 30, 0.12) 1px, transparent 1px),
-    linear-gradient(140deg, #b23a2d, #e0a05a 52%, #176a68);
-  background-size: 56px 34px, 56px 34px, auto;
-}
-
-.qz-building-figure svg {
-  width: 180px;
-  height: 180px;
-  color: rgba(255, 248, 239, 0.9);
-  filter: drop-shadow(0 18px 28px rgba(36, 27, 23, 0.25));
-}
-
-.qz-building-figure span {
-  position: absolute;
-  left: 10%;
-  right: 10%;
-  bottom: 18%;
-  height: 10px;
-  background: rgba(255, 248, 239, 0.74);
-  transform: skewY(-7deg);
+  box-shadow: 0 24px 40px rgba(127, 38, 30, 0.16);
 }
 
 .qz-heritage-table {
@@ -647,7 +627,7 @@ body {
   grid-template-columns: 100px 90px 1fr;
   gap: 18px;
   align-items: start;
-  padding: 26px 0;
+  padding: 26px 28px;
   background: var(--qz-paper);
 }
 
