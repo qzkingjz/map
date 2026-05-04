@@ -1,0 +1,13 @@
+services:
+  qiaoqing-map:
+    build:
+      context: .
+    image: qiaoqing-map:latest
+    container_name: qiaoqing-map
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      PORT: 3000
+    ports:
+      - "${HOST_PORT:-3000}:3000"

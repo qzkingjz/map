@@ -6,3 +6,6 @@ coverage/
 *.log
 .env*
 !.env.example
+process-test.txt
+npm-version-*.txt
+{console.error(e)
