@@ -143,6 +143,15 @@ const adminBootstrapConfig = {
 const adminSessionCookieName = "qiaoqing_admin_session";
 const adminSessionTtlMs = Number(process.env.APP_SESSION_TTL_HOURS ?? 12) * 60 * 60 * 1000;
 const adminCookieSecure = isTruthy(process.env.APP_COOKIE_SECURE);
+const captchaTtlMs = Number(process.env.APP_CAPTCHA_TTL_SECONDS ?? 300) * 1000;
+
+interface CaptchaChallenge {
+  answerHash: string;
+  expiresAt: number;
+  attempts: number;
+}
+
+const captchaStore = new Map<string, CaptchaChallenge>();
 
 const newsSearchConfig = {
   tavilyApiKey: process.env.TAVILY_API_KEY?.trim(),
@@ -2312,14 +2321,129 @@ async function countActiveSuperAdmins(excludeUserId?: number): Promise<number> {
   return Number(rows[0]?.count ?? 0);
 }
 
+function cleanupExpiredCaptchas(): void {
+  const now = Date.now();
+  for (const [id, challenge] of captchaStore.entries()) {
+    if (challenge.expiresAt <= now) {
+      captchaStore.delete(id);
+    }
+  }
+}
+
+function hashCaptchaAnswer(id: string, answer: string): string {
+  return crypto
+    .createHash("sha256")
+    .update(`${id}:${answer.trim().toUpperCase()}:${adminSessionCookieName}`)
+    .digest("hex");
+}
+
+function createCaptchaText(): string {
+  const alphabet = "23456789ABCDEFGHJKLMNPQRSTUVWXYZ";
+  let value = "";
+  for (let index = 0; index < 4; index += 1) {
+    value += alphabet[crypto.randomInt(0, alphabet.length)];
+  }
+  return value;
+}
+
+function createCaptchaSvg(text: string): string {
+  const chars = text.split("");
+  const lines = Array.from({ length: 5 }, () => {
+    const x1 = crypto.randomInt(4, 112);
+    const y1 = crypto.randomInt(6, 38);
+    const x2 = crypto.randomInt(8, 118);
+    const y2 = crypto.randomInt(8, 40);
+    const opacity = (crypto.randomInt(22, 42) / 100).toFixed(2);
+    return `<line x1="${x1}" y1="${y1}" x2="${x2}" y2="${y2}" stroke="#b33a2d" stroke-width="1.2" opacity="${opacity}" />`;
+  }).join("");
+
+  const dots = Array.from({ length: 18 }, () => {
+    const cx = crypto.randomInt(4, 120);
+    const cy = crypto.randomInt(4, 42);
+    const opacity = (crypto.randomInt(24, 48) / 100).toFixed(2);
+    return `<circle cx="${cx}" cy="${cy}" r="1" fill="#166a68" opacity="${opacity}" />`;
+  }).join("");
+
+  const letters = chars
+    .map((char, index) => {
+      const x = 18 + index * 25 + crypto.randomInt(-2, 3);
+      const y = 30 + crypto.randomInt(-3, 4);
+      const rotate = crypto.randomInt(-12, 13);
+      return `<text x="${x}" y="${y}" transform="rotate(${rotate} ${x} ${y})">${char}</text>`;
+    })
+    .join("");
+
+  return `<svg xmlns="http://www.w3.org/2000/svg" width="128" height="44" viewBox="0 0 128 44" role="img" aria-label="captcha">
+    <rect width="128" height="44" rx="4" fill="#fffaf2" />
+    ${lines}
+    ${dots}
+    <g fill="#74251f" font-family="Georgia, 'Times New Roman', serif" font-size="24" font-weight="700" letter-spacing="3">${letters}</g>
+  </svg>`;
+}
+
+function issueCaptcha() {
+  cleanupExpiredCaptchas();
+  const id = crypto.randomBytes(16).toString("base64url");
+  const answer = createCaptchaText();
+  captchaStore.set(id, {
+    answerHash: hashCaptchaAnswer(id, answer),
+    expiresAt: Date.now() + captchaTtlMs,
+    attempts: 0,
+  });
+
+  return {
+    id,
+    svg: createCaptchaSvg(answer),
+    expiresInSeconds: Math.max(1, Math.floor(captchaTtlMs / 1000)),
+  };
+}
+
+function verifyCaptcha(captchaId: unknown, captchaAnswer: unknown): boolean {
+  const id = typeof captchaId === "string" ? captchaId.trim() : "";
+  const answer = typeof captchaAnswer === "string" ? captchaAnswer.trim() : "";
+  if (!id || !answer) return false;
+
+  const challenge = captchaStore.get(id);
+  if (!challenge || challenge.expiresAt <= Date.now()) {
+    captchaStore.delete(id);
+    return false;
+  }
+
+  challenge.attempts += 1;
+  const expected = Buffer.from(challenge.answerHash, "hex");
+  const actual = Buffer.from(hashCaptchaAnswer(id, answer), "hex");
+  const isValid =
+    expected.length === actual.length && crypto.timingSafeEqual(expected, actual);
+
+  if (isValid || challenge.attempts >= 3) {
+    captchaStore.delete(id);
+  }
+
+  return isValid;
+}
+
 function registerAdminRoutes(app: express.Express) {
+  app.get("/api/auth/captcha", (_req, res) => {
+    res.setHeader("Cache-Control", "no-store");
+    return res.json(issueCaptcha());
+  });
+
   app.post("/api/auth/login", async (req, res) => {
     try {
       const username = typeof req.body?.username === "string" ? req.body.username.trim() : "";
       const password = typeof req.body?.password === "string" ? req.body.password : "";
+      const captchaId = req.body?.captchaId;
+      const captchaAnswer = req.body?.captchaAnswer;
 
       if (!username || !password) {
         return res.status(400).json({ error: "Username and password are required" });
+      }
+
+      if (!verifyCaptcha(captchaId, captchaAnswer)) {
+        await writeAuditLog("auth.captcha_failed", req, {
+          detail: { username },
+        });
+        return res.status(400).json({ error: "验证码错误或已过期，请刷新后重试" });
       }
 
       const pool = getAdminDbPool();
@@ -2968,7 +3092,14 @@ async function startServer() {
   const app = express();
 
   app.use(express.json());
-  await ensureAdminBootstrap();
+  try {
+    await ensureAdminBootstrap();
+  } catch (error) {
+    console.warn(
+      "[admin] Database bootstrap failed; admin login will be unavailable until the database is reachable:",
+      getErrorMessage(error)
+    );
+  }
   registerAdminRoutes(app);
 
   app.get("/healthz", (_req, res) => {

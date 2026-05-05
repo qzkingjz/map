@@ -1,7 +1,14 @@
-import { FormEvent, useState } from 'react';
+import { FormEvent, useEffect, useState } from 'react';
 import { motion } from 'motion/react';
-import { ArrowRight, Database, LockKeyhole, ShieldCheck, UserRound } from 'lucide-react';
-import { AdminUser, loginAdmin } from '../lib/adminApi';
+import {
+  ArrowRight,
+  Database,
+  LockKeyhole,
+  RefreshCw,
+  ShieldCheck,
+  UserRound,
+} from 'lucide-react';
+import { AdminUser, LoginCaptcha, getLoginCaptcha, loginAdmin } from '../lib/adminApi';
 
 interface LoginPageProps {
   onLogin: (user: AdminUser) => void;
@@ -11,19 +18,51 @@ interface LoginPageProps {
 export default function LoginPage({ onLogin, onBackHome }: LoginPageProps) {
   const [username, setUsername] = useState('admin');
   const [password, setPassword] = useState('');
+  const [captchaAnswer, setCaptchaAnswer] = useState('');
+  const [captcha, setCaptcha] = useState<LoginCaptcha | null>(null);
   const [error, setError] = useState('');
   const [isLoading, setIsLoading] = useState(false);
+  const [isCaptchaLoading, setIsCaptchaLoading] = useState(false);
+
+  async function refreshCaptcha() {
+    setIsCaptchaLoading(true);
+    try {
+      const nextCaptcha = await getLoginCaptcha();
+      setCaptcha(nextCaptcha);
+      setCaptchaAnswer('');
+    } catch (caughtError) {
+      setError(caughtError instanceof Error ? caughtError.message : '验证码加载失败，请刷新页面重试');
+    } finally {
+      setIsCaptchaLoading(false);
+    }
+  }
+
+  useEffect(() => {
+    void refreshCaptcha();
+  }, []);
 
   async function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     setError('');
+
+    if (!captcha) {
+      setError('验证码还未加载完成，请稍后重试');
+      return;
+    }
+
+    if (!captchaAnswer.trim()) {
+      setError('请输入验证码');
+      return;
+    }
+
     setIsLoading(true);
 
     try {
-      const user = await loginAdmin(username, password);
+      const user = await loginAdmin(username, password, captcha.id, captchaAnswer);
       onLogin(user);
     } catch (caughtError) {
       setError(caughtError instanceof Error ? caughtError.message : '登录失败，请稍后重试');
+      void refreshCaptcha();
     } finally {
       setIsLoading(false);
     }
@@ -104,6 +143,42 @@ export default function LoginPage({ onLogin, onBackHome }: LoginPageProps) {
               onChange={event => setPassword(event.target.value)}
               placeholder="请输入登录密码"
             />
+          </div>
+        </label>
+
+        <label>
+          <span>验证码</span>
+          <div className="admin-captcha-row">
+            <input
+              autoComplete="off"
+              inputMode="text"
+              maxLength={6}
+              value={captchaAnswer}
+              onChange={event => setCaptchaAnswer(event.target.value)}
+              placeholder="请输入验证码"
+            />
+            <button
+              aria-label="刷新验证码"
+              className="admin-captcha-image"
+              disabled={isCaptchaLoading}
+              type="button"
+              onClick={refreshCaptcha}
+            >
+              {captcha ? (
+                <span dangerouslySetInnerHTML={{ __html: captcha.svg }} />
+              ) : (
+                <small>加载中</small>
+              )}
+            </button>
+            <button
+              aria-label="换一张验证码"
+              className="admin-captcha-refresh"
+              disabled={isCaptchaLoading}
+              type="button"
+              onClick={refreshCaptcha}
+            >
+              <RefreshCw />
+            </button>
           </div>
         </label>
 

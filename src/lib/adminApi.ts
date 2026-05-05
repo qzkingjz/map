@@ -104,6 +104,12 @@ export interface NewsArticle {
   createdAt?: string | null;
 }
 
+export interface LoginCaptcha {
+  id: string;
+  svg: string;
+  expiresInSeconds: number;
+}
+
 async function readApiError(response: Response, fallback: string): Promise<string> {
   try {
     const payload = await response.json();
@@ -130,10 +136,19 @@ async function requestJson<T>(path: string, options: RequestInit = {}): Promise<
   return response.json() as Promise<T>;
 }
 
-export async function loginAdmin(username: string, password: string): Promise<AdminUser> {
+export async function getLoginCaptcha(): Promise<LoginCaptcha> {
+  return requestJson<LoginCaptcha>('/api/auth/captcha');
+}
+
+export async function loginAdmin(
+  username: string,
+  password: string,
+  captchaId: string,
+  captchaAnswer: string
+): Promise<AdminUser> {
   const data = await requestJson<{ user: AdminUser }>('/api/auth/login', {
     method: 'POST',
-    body: JSON.stringify({ username, password }),
+    body: JSON.stringify({ username, password, captchaId, captchaAnswer }),
   });
 
   return data.user;
