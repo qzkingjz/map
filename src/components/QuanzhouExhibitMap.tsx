@@ -153,23 +153,44 @@ export default function QuanzhouExhibitMap({
     if (!container) return;
 
     registerWorldMap();
-    const chart = echarts.init(container);
-    instanceRef.current = chart;
-    chart.setOption(option);
+    let chart: echarts.ECharts | null = null;
+    let isDisposed = false;
 
     const handleClick = (params: any) => {
       const point = params.data?.point as MigrationPoint | undefined;
       if (point) onSelect(point);
     };
 
-    const resizeObserver = new ResizeObserver(() => chart.resize());
+    const ensureChart = () => {
+      if (isDisposed) return;
+
+      const { width, height } = container.getBoundingClientRect();
+      if (width <= 0 || height <= 0) {
+        return;
+      }
+
+      if (!chart) {
+        chart = echarts.init(container);
+        instanceRef.current = chart;
+        chart.setOption(option);
+        chart.on('click', handleClick);
+        return;
+      }
+
+      chart.resize();
+    };
+
+    const resizeObserver = new ResizeObserver(() => {
+      window.requestAnimationFrame(ensureChart);
+    });
     resizeObserver.observe(container);
-    chart.on('click', handleClick);
+    window.requestAnimationFrame(ensureChart);
 
     return () => {
-      chart.off('click', handleClick);
+      isDisposed = true;
       resizeObserver.disconnect();
-      chart.dispose();
+      chart?.off('click', handleClick);
+      chart?.dispose();
       instanceRef.current = null;
     };
   }, [onSelect]);

@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { motion } from 'motion/react';
 import {
   ArrowDownRight,
@@ -8,8 +8,12 @@ import {
   ShipWheel,
 } from 'lucide-react';
 import AiMapExperience from './components/AiMapExperience';
+import AdminDashboard from './components/AdminDashboard';
+import LatestNewsPage from './components/LatestNewsPage';
+import LoginPage from './components/LoginPage';
 import QuanzhouExhibitMap, { MigrationPoint } from './components/QuanzhouExhibitMap';
 import heritageNanyangImage from './assets/heritage-nanyang.png';
+import { AdminUser, getCurrentAdmin, logoutAdmin, recordPageView } from './lib/adminApi';
 
 const migrationPoints: MigrationPoint[] = [
   {
@@ -97,6 +101,139 @@ const memoryItems = [
 export default function App() {
   const [view, setView] = useState<'exhibit' | 'map'>('exhibit');
   const [activePoint, setActivePoint] = useState<MigrationPoint>(migrationPoints[0]);
+  const [route, setRoute] = useState(window.location.pathname);
+  const [authUser, setAuthUser] = useState<AdminUser | null>(null);
+  const [authStatus, setAuthStatus] = useState<'checking' | 'authenticated' | 'anonymous'>('checking');
+
+  useEffect(() => {
+    const handlePopState = () => setRoute(window.location.pathname);
+    window.addEventListener('popstate', handlePopState);
+    return () => window.removeEventListener('popstate', handlePopState);
+  }, []);
+
+  function navigate(
+    path: string,
+    state: Record<string, unknown> = {},
+    options: { replace?: boolean } = {}
+  ) {
+    if (options.replace) {
+      window.history.replaceState(state, '', path);
+    } else {
+      window.history.pushState(state, '', path);
+    }
+    setRoute(path);
+  }
+
+  async function handleLogout() {
+    try {
+      await logoutAdmin();
+    } finally {
+      setAuthUser(null);
+      setAuthStatus('anonymous');
+      setView('exhibit');
+      navigate('/login', {}, { replace: true });
+    }
+  }
+
+  function recordSectionView(page: string) {
+    void recordPageView(page, `${route}${window.location.hash}`);
+  }
+
+  useEffect(() => {
+    let isActive = true;
+
+    async function checkSession() {
+      if (route === '/login') {
+        setAuthStatus('anonymous');
+        return;
+      }
+
+      setAuthStatus('checking');
+
+      try {
+        const user = await getCurrentAdmin();
+        if (!isActive) return;
+
+        if (!user) {
+          setAuthUser(null);
+          setAuthStatus('anonymous');
+          navigate('/login', {}, { replace: true });
+          return;
+        }
+
+        setAuthUser(user);
+        setAuthStatus('authenticated');
+
+        if (route === '/admin' && user.role !== 'super_admin') {
+          navigate('/', { authenticatedEntry: true }, { replace: true });
+        }
+      } catch {
+        if (!isActive) return;
+        setAuthUser(null);
+        setAuthStatus('anonymous');
+        navigate('/login', {}, { replace: true });
+      }
+    }
+
+    void checkSession();
+
+    return () => {
+      isActive = false;
+    };
+  }, [route]);
+
+  useEffect(() => {
+    if (authStatus !== 'authenticated') return;
+
+    if (route === '/') {
+      void recordPageView(view === 'map' ? '侨情监测' : '展示首页', route);
+    }
+    if (route === '/latest') {
+      void recordPageView('最新侨情', route);
+    }
+  }, [authStatus, route, view]);
+
+  if (route === '/login') {
+    return (
+        <LoginPage
+        onLogin={user => {
+          setAuthUser(user);
+          setAuthStatus('authenticated');
+          navigate(
+            user.role === 'super_admin' ? '/admin' : '/',
+            user.role === 'super_admin' ? {} : { authenticatedEntry: true }
+          );
+        }}
+        onBackHome={() => navigate('/login')}
+      />
+    );
+  }
+
+  if (authStatus === 'checking' || !authUser) {
+    return (
+      <main className="admin-auth-loading">
+        <div>
+          <span>泉州华侨大学</span>
+          <strong>正在校验登录状态</strong>
+        </div>
+      </main>
+    );
+  }
+
+  if (route === '/admin') {
+    return (
+      <AdminDashboard
+        onRequireLogin={() => navigate('/login')}
+        onBackHome={() => {
+          navigate('/', { authenticatedEntry: true });
+        }}
+      />
+    );
+  }
+
+  if (route === '/latest') {
+    return <LatestNewsPage onBack={() => navigate('/')} />;
+  }
 
   if (view === 'map') {
     return <AiMapExperience onBack={() => setView('exhibit')} />;
@@ -110,12 +247,26 @@ export default function App() {
           <strong>世界泉州</strong>
         </a>
         <nav>
-          <a href="#atlas">时空图谱</a>
-          <a href="#economy">经济动能</a>
-          <a href="#memory">文化根脉</a>
-          <a href="#heritage">建筑遗产</a>
+          <a href="#atlas" onClick={() => recordSectionView('时空图谱')}>
+            时空图谱
+          </a>
+          <a href="#economy" onClick={() => recordSectionView('经济动能')}>
+            经济动能
+          </a>
+          <a href="#memory" onClick={() => recordSectionView('文化根脉')}>
+            文化根脉
+          </a>
+          <a href="#heritage" onClick={() => recordSectionView('建筑遗产')}>
+            建筑遗产
+          </a>
+          <button type="button" onClick={() => navigate('/latest')}>
+            最新侨情
+          </button>
           <button type="button" onClick={() => setView('map')}>
-            侨情检测
+            侨情监测
+          </button>
+          <button className="qz-logout" type="button" onClick={handleLogout}>
+            退出系统
           </button>
         </nav>
       </header>
@@ -141,11 +292,18 @@ export default function App() {
             侨批记忆与番仔楼遗产，整理成一条可浏览、可感知的海丝叙事。
           </p>
           <div className="qz-hero-actions">
-            <a href="#atlas">进入展厅</a>
+            <a href="#atlas" onClick={() => recordSectionView('进入展厅')}>
+              进入展厅
+            </a>
             <button type="button" onClick={() => setView('map')}>
-              侨情检测
+              侨情监测
             </button>
-            <a href="#heritage">查看遗产</a>
+            <a href="#heritage" onClick={() => recordSectionView('查看遗产')}>
+              查看遗产
+            </a>
+            <button type="button" onClick={() => navigate('/latest')}>
+              最新侨情
+            </button>
           </div>
         </motion.div>
 
