@@ -12,6 +12,49 @@ import { FollowupTarget, UiTheme } from '../lib/ui';
 const WORLD_CENTER: [number, number] = [20, 0];
 const WORLD_ZOOM = 2;
 const WORLD_BOUNDS = L.latLngBounds([-58, -180], [78, 180]);
+const BROAD_LOCATION_ZOOM = 4;
+const CITY_LOCATION_ZOOM = 8;
+const BROAD_LOCATION_NAMES = new Set([
+  '中国',
+  '美国',
+  '加拿大',
+  '巴西',
+  '阿根廷',
+  '智利',
+  '墨西哥',
+  '澳大利亚',
+  '新西兰',
+  '俄罗斯',
+  '印度',
+  '印度尼西亚',
+  '马来西亚',
+  '菲律宾',
+  '泰国',
+  '缅甸',
+  '越南',
+  '新加坡',
+  '日本',
+  '韩国',
+  '英国',
+  '法国',
+  '德国',
+  '意大利',
+  '西班牙',
+  '葡萄牙',
+  '荷兰',
+  '南非',
+  '埃及',
+  '欧洲',
+  '亚洲',
+  '非洲',
+  '北美洲',
+  '南美洲',
+  '大洋洲',
+  '东南亚',
+  '中东',
+  '拉美',
+  '南洋',
+]);
 
 const getWorldGeoJson = () => {
   const topo = worldAtlas110m as any;
@@ -28,6 +71,9 @@ const isValidCity = (city: CityData | undefined | null): city is CityData =>
 
 const getCityDisplayInfo = (city: CityData, showReferences: boolean) =>
   showReferences ? city.infoWithReferences ?? city.info : city.info;
+
+const getSingleLocationZoom = (city: CityData) =>
+  BROAD_LOCATION_NAMES.has(city.name.trim()) ? BROAD_LOCATION_ZOOM : CITY_LOCATION_ZOOM;
 
 const createGlowingIcon = () =>
   L.divIcon({
@@ -58,7 +104,7 @@ function MapEventHandler({
 
     if (validCities.length > 0) {
       if (validCities.length === 1) {
-        map.flyTo([validCities[0].lat, validCities[0].lng], 8, {
+        map.flyTo([validCities[0].lat, validCities[0].lng], getSingleLocationZoom(validCities[0]), {
           duration: 1.5,
           easeLinearity: 0.25,
         });
