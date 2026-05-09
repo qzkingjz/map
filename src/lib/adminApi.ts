@@ -1,4 +1,5 @@
 export type AdminRole = 'super_admin' | 'admin' | 'viewer';
+export type AdminPermission = 'overview' | 'users' | 'collection' | 'audit' | 'ragflow';
 
 export interface AdminUser {
   id: number;
@@ -6,6 +7,7 @@ export interface AdminUser {
   displayName: string;
   role: AdminRole;
   status: 'active' | 'disabled';
+  menuPermissions: AdminPermission[];
   email?: string | null;
   phone?: string | null;
   lastLoginAt?: string | null;
@@ -18,6 +20,7 @@ export interface AdminUserInput {
   displayName: string;
   role: AdminRole;
   status: 'active' | 'disabled';
+  menuPermissions?: AdminPermission[];
   password?: string;
   email?: string | null;
   phone?: string | null;
@@ -63,6 +66,36 @@ export interface RagflowStatus {
   chatId?: string;
   model?: string;
   message?: string;
+}
+
+export interface TextCleaningPreview {
+  enabled: boolean;
+  text: string;
+  stats: {
+    originalLength: number;
+    cleanedLength: number;
+    removedCharacters: number;
+    removedLines: number;
+    dedupedLines: number;
+  };
+}
+
+export type TextCleaningUploadMode = 'cleaned' | 'ragflow_parse_required' | 'unsupported';
+
+export interface TextCleaningUploadResult extends TextCleaningPreview {
+  filename: string;
+  mimeType: string;
+  bytes: number;
+  mode: TextCleaningUploadMode;
+  documentType: string;
+  message: string;
+  suggestedSteps: string[];
+  savedFiles: Array<{
+    kind: 'original' | 'cleaned';
+    filename: string;
+    path: string;
+    bytes: number;
+  }>;
 }
 
 export interface CollectionTask {
@@ -210,6 +243,30 @@ export async function getAuditLogs(): Promise<AuditLog[]> {
 
 export async function getRagflowStatus(): Promise<RagflowStatus> {
   return requestJson<RagflowStatus>('/api/admin/ragflow/status');
+}
+
+export async function previewTextCleaning(text: string): Promise<TextCleaningPreview> {
+  return requestJson<TextCleaningPreview>('/api/admin/cleaning/preview', {
+    method: 'POST',
+    body: JSON.stringify({ text }),
+  });
+}
+
+export async function uploadCleaningFile(file: File): Promise<TextCleaningUploadResult> {
+  const formData = new FormData();
+  formData.append('file', file, file.name);
+
+  const response = await fetch('/api/admin/cleaning/upload', {
+    method: 'POST',
+    credentials: 'include',
+    body: formData,
+  });
+
+  if (!response.ok) {
+    throw new Error(await readApiError(response, `/api/admin/cleaning/upload returned ${response.status}`));
+  }
+
+  return response.json() as Promise<TextCleaningUploadResult>;
 }
 
 export async function runCollectionTask(input: {

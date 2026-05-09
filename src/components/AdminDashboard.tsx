@@ -7,8 +7,10 @@ import {
   DoorOpen,
   ExternalLink,
   FileClock,
+  FileText,
   Globe2,
   LayoutDashboard,
+  Download,
   Newspaper,
   Pencil,
   Plus,
@@ -16,10 +18,12 @@ import {
   Search,
   ShieldCheck,
   Trash2,
+  Upload,
   UsersRound,
   X,
 } from 'lucide-react';
 import {
+  AdminPermission,
   AdminRole,
   AdminSummary,
   AdminUser,
@@ -28,6 +32,7 @@ import {
   CollectionTask,
   NewsArticle,
   RagflowStatus,
+  TextCleaningUploadResult,
   createAdminUser,
   deleteAdminUser,
   getCollectionArticles,
@@ -40,6 +45,7 @@ import {
   logoutAdmin,
   recordPageView,
   runCollectionTask,
+  uploadCleaningFile,
   updateCollectionArticleStatus,
   updateAdminUser,
 } from '../lib/adminApi';
@@ -54,10 +60,12 @@ interface AdminDashboardProps {
 const tabs: Array<{ id: AdminTab; label: string; icon: typeof LayoutDashboard }> = [
   { id: 'overview', label: '总览', icon: LayoutDashboard },
   { id: 'users', label: '用户', icon: UsersRound },
-  { id: 'collection', label: '数据采集', icon: Newspaper },
+  { id: 'collection', label: '数据采集/清洗', icon: Newspaper },
   { id: 'audit', label: '审计', icon: FileClock },
   { id: 'ragflow', label: 'RAGFlow', icon: DatabaseZap },
 ];
+
+const configurableAdminTabs = tabs.filter(tab => tab.id !== 'users');
 
 type UserEditorMode = 'create' | 'edit';
 
@@ -66,6 +74,7 @@ interface UserFormState {
   displayName: string;
   role: AdminRole;
   status: 'active' | 'disabled';
+  menuPermissions: AdminPermission[];
   password: string;
   email: string;
   phone: string;
@@ -86,10 +95,42 @@ const emptyUserForm: UserFormState = {
   displayName: '',
   role: 'viewer',
   status: 'active',
+  menuPermissions: [],
   password: '',
   email: '',
   phone: '',
 };
+
+function readAdminTabFromHash(): AdminTab {
+  const hash = window.location.hash.replace(/^#/, '');
+  return tabs.some(tab => tab.id === hash) ? (hash as AdminTab) : 'overview';
+}
+
+function writeAdminTabHash(tab: AdminTab) {
+  const nextUrl = `${window.location.pathname}#${tab}`;
+  if (`${window.location.pathname}${window.location.hash}` !== nextUrl) {
+    window.history.replaceState(null, '', nextUrl);
+  }
+}
+
+function allowedTabsForUser(user: AdminUser | null): typeof tabs {
+  if (!user) return [];
+  if (user.role === 'super_admin') return tabs;
+  if (user.role !== 'admin') return [];
+
+  const allowed = new Set(user.menuPermissions ?? []);
+  return tabs.filter(tab => tab.id !== 'users' && allowed.has(tab.id));
+}
+
+function menuPermissionLabel(permission: AdminPermission): string {
+  return tabs.find(tab => tab.id === permission)?.label ?? permission;
+}
+
+function normalizeUserFormPermissions(role: AdminRole, permissions: AdminPermission[]): AdminPermission[] {
+  if (role === 'super_admin') return tabs.map(tab => tab.id);
+  if (role === 'viewer') return [];
+  return permissions.length > 0 ? permissions : ['collection'];
+}
 
 function formatDate(value?: string | null): string {
   if (!value) return '未记录';
@@ -167,6 +208,18 @@ function sourceTypeText(sourceType: CollectionTask['sourceType']): string {
   return '手动';
 }
 
+function cleaningModeText(mode: TextCleaningUploadResult['mode']): string {
+  if (mode === 'cleaned') return '已完成清洗';
+  if (mode === 'ragflow_parse_required') return '需先解析';
+  return '暂不支持';
+}
+
+function cleanedDownloadName(filename: string): string {
+  const dotIndex = filename.lastIndexOf('.');
+  if (dotIndex <= 0) return `${filename}.cleaned.txt`;
+  return `${filename.slice(0, dotIndex)}.cleaned${filename.slice(dotIndex)}`;
+}
+
 function sleep(ms: number): Promise<void> {
   return new Promise(resolve => {
     window.setTimeout(resolve, ms);
@@ -181,7 +234,7 @@ function elapsedText(startedAt: number, now: number): string {
 }
 
 export default function AdminDashboard({ onRequireLogin, onBackHome }: AdminDashboardProps) {
-  const [activeTab, setActiveTab] = useState<AdminTab>('overview');
+  const [activeTab, setActiveTab] = useState<AdminTab>(() => readAdminTabFromHash());
   const [currentUser, setCurrentUser] = useState<AdminUser | null>(null);
   const [summary, setSummary] = useState<AdminSummary | null>(null);
   const [users, setUsers] = useState<AdminUser[]>([]);
@@ -195,6 +248,10 @@ export default function AdminDashboard({ onRequireLogin, onBackHome }: AdminDash
   const [collectionSourceMode, setCollectionSourceMode] = useState<'auto' | 'crawler' | 'tavily'>('auto');
   const [isCollecting, setIsCollecting] = useState(false);
   const [collectionProgress, setCollectionProgress] = useState<CollectionProgress | null>(null);
+  const [cleaningFile, setCleaningFile] = useState<File | null>(null);
+  const [cleaningResult, setCleaningResult] = useState<TextCleaningUploadResult | null>(null);
+  const [cleaningError, setCleaningError] = useState('');
+  const [isCleaningUploading, setIsCleaningUploading] = useState(false);
   const [progressNow, setProgressNow] = useState(Date.now());
   const [error, setError] = useState('');
   const [isLoading, setIsLoading] = useState(true);
@@ -209,6 +266,11 @@ export default function AdminDashboard({ onRequireLogin, onBackHome }: AdminDash
     if (ragflowStatus.ok) return '连接正常';
     return '连接异常';
   }, [ragflowStatus]);
+  const visibleTabs = useMemo(() => allowedTabsForUser(currentUser), [currentUser]);
+  const canViewOverview = visibleTabs.some(tab => tab.id === 'overview');
+  const canViewUsers = currentUser?.role === 'super_admin';
+  const canViewAudit = visibleTabs.some(tab => tab.id === 'audit');
+  const canViewCollection = visibleTabs.some(tab => tab.id === 'collection');
 
   async function loadDashboard() {
     setError('');
@@ -221,22 +283,35 @@ export default function AdminDashboard({ onRequireLogin, onBackHome }: AdminDash
         return;
       }
 
-      if (me.role !== 'super_admin') {
+      if (me.role !== 'super_admin' && me.role !== 'admin') {
         onBackHome();
         return;
       }
 
       setCurrentUser(me);
+      const nextVisibleTabs = allowedTabsForUser(me);
+      if (nextVisibleTabs.length === 0) {
+        setError('当前账号没有可访问的后台菜单，请联系系统管理员分配权限');
+        return;
+      }
+
+      const nextActiveTab = nextVisibleTabs.some(tab => tab.id === activeTab)
+        ? activeTab
+        : nextVisibleTabs[0].id;
+      if (nextActiveTab !== activeTab) {
+        handleTabChange(nextActiveTab);
+      }
+
       const [nextSummary, nextUsers, nextLogs] = await Promise.all([
-        getAdminSummary(),
-        getAdminUsers(),
-        getAuditLogs(),
+        nextVisibleTabs.some(tab => tab.id === 'overview') ? getAdminSummary() : Promise.resolve(null),
+        me.role === 'super_admin' ? getAdminUsers() : Promise.resolve([]),
+        nextVisibleTabs.some(tab => tab.id === 'audit') ? getAuditLogs() : Promise.resolve([]),
       ]);
 
       setSummary(nextSummary);
       setUsers(nextUsers);
       setLogs(nextLogs);
-      if (activeTab === 'collection') {
+      if (nextActiveTab === 'collection') {
         const [tasks, articles] = await Promise.all([
           getCollectionTasks(),
           getCollectionArticles(),
@@ -283,6 +358,38 @@ export default function AdminDashboard({ onRequireLogin, onBackHome }: AdminDash
   async function handleLogout() {
     await logoutAdmin();
     onRequireLogin();
+  }
+
+  function handleTabChange(tab: AdminTab) {
+    writeAdminTabHash(tab);
+    setActiveTab(tab);
+  }
+
+  function handleUserRoleChange(role: AdminRole) {
+    setUserForm(current => ({
+      ...current,
+      role,
+      menuPermissions: normalizeUserFormPermissions(role, current.menuPermissions),
+    }));
+  }
+
+  function toggleUserPermission(permission: AdminPermission) {
+    setUserForm(current => {
+      const currentPermissions = new Set(current.menuPermissions);
+      if (currentPermissions.has(permission)) {
+        currentPermissions.delete(permission);
+      } else {
+        currentPermissions.add(permission);
+      }
+
+      return {
+        ...current,
+        menuPermissions: normalizeUserFormPermissions(
+          current.role,
+          Array.from(currentPermissions)
+        ),
+      };
+    });
   }
 
   function updateProgressFromTask(task: CollectionTask, startedAt: number) {
@@ -385,6 +492,43 @@ export default function AdminDashboard({ onRequireLogin, onBackHome }: AdminDash
     }
   }
 
+  async function handleUploadCleaningFile() {
+    if (!cleaningFile) {
+      setCleaningError('请先选择一个文本类文件');
+      return;
+    }
+
+    setCleaningError('');
+    setIsCleaningUploading(true);
+    writeAdminTabHash('collection');
+    try {
+      setCleaningResult(await uploadCleaningFile(cleaningFile));
+    } catch (caughtError) {
+      setCleaningResult(null);
+      setCleaningError(caughtError instanceof Error ? caughtError.message : '文件清洗失败');
+    } finally {
+      setIsCleaningUploading(false);
+    }
+  }
+
+  function handleDownloadCleaningResult() {
+    if (!cleaningResult?.text) return;
+
+    const blob = new Blob([cleaningResult.text], {
+      type: cleaningResult.mimeType?.startsWith('text/')
+        ? `${cleaningResult.mimeType};charset=utf-8`
+        : 'text/plain;charset=utf-8',
+    });
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement('a');
+    anchor.href = url;
+    anchor.download = cleanedDownloadName(cleaningResult.filename);
+    document.body.append(anchor);
+    anchor.click();
+    anchor.remove();
+    URL.revokeObjectURL(url);
+  }
+
   function openCreateUser() {
     setEditingUser(null);
     setUserForm(emptyUserForm);
@@ -399,6 +543,7 @@ export default function AdminDashboard({ onRequireLogin, onBackHome }: AdminDash
       displayName: user.displayName,
       role: user.role,
       status: user.status,
+      menuPermissions: normalizeUserFormPermissions(user.role, user.menuPermissions ?? []),
       password: '',
       email: user.email ?? '',
       phone: user.phone ?? '',
@@ -420,6 +565,7 @@ export default function AdminDashboard({ onRequireLogin, onBackHome }: AdminDash
       displayName: userForm.displayName.trim(),
       role: userForm.role,
       status: userForm.status,
+      menuPermissions: normalizeUserFormPermissions(userForm.role, userForm.menuPermissions),
       password: userForm.password.trim() ? userForm.password : undefined,
       email: userForm.email.trim() || null,
       phone: userForm.phone.trim() || null,
@@ -448,7 +594,7 @@ export default function AdminDashboard({ onRequireLogin, onBackHome }: AdminDash
 
       closeUserEditor();
       await loadDashboard();
-      setActiveTab('users');
+      handleTabChange('users');
     } catch (caughtError) {
       setUserActionError(caughtError instanceof Error ? caughtError.message : '用户保存失败');
     } finally {
@@ -465,7 +611,7 @@ export default function AdminDashboard({ onRequireLogin, onBackHome }: AdminDash
     try {
       await deleteAdminUser(user.id);
       await loadDashboard();
-      setActiveTab('users');
+      handleTabChange('users');
     } catch (caughtError) {
       setUserActionError(caughtError instanceof Error ? caughtError.message : '用户删除失败');
     }
@@ -473,6 +619,19 @@ export default function AdminDashboard({ onRequireLogin, onBackHome }: AdminDash
 
   useEffect(() => {
     void loadDashboard();
+  }, []);
+
+  useEffect(() => {
+    writeAdminTabHash(activeTab);
+  }, [activeTab]);
+
+  useEffect(() => {
+    const handleHashChange = () => {
+      setActiveTab(readAdminTabFromHash());
+    };
+
+    window.addEventListener('hashchange', handleHashChange);
+    return () => window.removeEventListener('hashchange', handleHashChange);
   }, []);
 
   useEffect(() => {
@@ -510,14 +669,14 @@ export default function AdminDashboard({ onRequireLogin, onBackHome }: AdminDash
         </button>
 
         <nav className="admin-nav" aria-label="后台导航">
-          {tabs.map(tab => {
+          {visibleTabs.map(tab => {
             const Icon = tab.icon;
             return (
               <button
                 key={tab.id}
                 type="button"
                 className={activeTab === tab.id ? 'is-active' : ''}
-                onClick={() => setActiveTab(tab.id)}
+                onClick={() => handleTabChange(tab.id)}
               >
                 <Icon />
                 <span>{tab.label}</span>
@@ -555,7 +714,7 @@ export default function AdminDashboard({ onRequireLogin, onBackHome }: AdminDash
 
         {error ? <p className="admin-alert">{error}</p> : null}
 
-        {activeTab === 'overview' ? (
+        {activeTab === 'overview' && canViewOverview ? (
           <motion.div
             className="admin-view"
             initial={{ opacity: 0, y: 16 }}
@@ -629,7 +788,7 @@ export default function AdminDashboard({ onRequireLogin, onBackHome }: AdminDash
           </motion.div>
         ) : null}
 
-        {activeTab === 'users' ? (
+        {activeTab === 'users' && canViewUsers ? (
           <motion.section
             className="admin-view admin-panel"
             initial={{ opacity: 0, y: 16 }}
@@ -683,7 +842,7 @@ export default function AdminDashboard({ onRequireLogin, onBackHome }: AdminDash
           </motion.section>
         ) : null}
 
-        {activeTab === 'collection' ? (
+        {activeTab === 'collection' && canViewCollection ? (
           <motion.section
             className="admin-view"
             initial={{ opacity: 0, y: 16 }}
@@ -778,6 +937,107 @@ export default function AdminDashboard({ onRequireLogin, onBackHome }: AdminDash
               ) : null}
             </div>
 
+            <div className="admin-panel admin-cleaning-panel">
+              <div className="admin-panel-head">
+                <span>本地文件</span>
+                <strong>轻量清洗</strong>
+              </div>
+              <div className="admin-cleaning-body">
+                <div className="admin-cleaning-upload">
+                  <label className="admin-file-picker">
+                    <FileText />
+                    <span>{cleaningFile ? cleaningFile.name : '选择上传文件'}</span>
+                    <input
+                      type="file"
+                      accept=".txt,.md,.markdown,.csv,.tsv,.json,.jsonl,.html,.htm,.xml,.yaml,.yml,.log,.sql,.pdf,.doc,.docx,.xls,.xlsx,.xlsm,.ppt,.pptx,.png,.jpg,.jpeg,.webp,.zip,.rar,.7z,.tar,.gz,.tgz,.bz2,text/*,application/json,application/pdf,application/zip,application/x-rar-compressed,application/x-7z-compressed"
+                      onChange={event => {
+                        const file = event.target.files?.[0] ?? null;
+                        setCleaningFile(file);
+                        setCleaningResult(null);
+                        setCleaningError('');
+                      }}
+                    />
+                  </label>
+                  <button
+                    type="button"
+                    onClick={handleUploadCleaningFile}
+                    disabled={!cleaningFile || isCleaningUploading}
+                  >
+                    <Upload />
+                    <span>{isCleaningUploading ? '清洗中' : '上传清洗'}</span>
+                  </button>
+                </div>
+
+                {cleaningError ? <p className="admin-inline-error">{cleaningError}</p> : null}
+
+                {cleaningResult ? (
+                  <div className="admin-cleaning-result">
+                    <div className="admin-cleaning-stats">
+                      <p>
+                        <span>文件</span>
+                        <strong>{cleaningResult.filename}</strong>
+                      </p>
+                      <p>
+                        <span>大小</span>
+                        <strong>{Math.round(cleaningResult.bytes / 1024)} KB</strong>
+                      </p>
+                      <p>
+                        <span>处理方式</span>
+                        <strong>{cleaningModeText(cleaningResult.mode)}</strong>
+                      </p>
+                      <p>
+                        <span>原始字符</span>
+                        <strong>{cleaningResult.stats.originalLength}</strong>
+                      </p>
+                      <p>
+                        <span>清洗后</span>
+                        <strong>{cleaningResult.stats.cleanedLength}</strong>
+                      </p>
+                      <p>
+                        <span>移除行</span>
+                        <strong>{cleaningResult.stats.removedLines}</strong>
+                      </p>
+                      <p>
+                        <span>重复行</span>
+                        <strong>{cleaningResult.stats.dedupedLines}</strong>
+                      </p>
+                    </div>
+                    {cleaningResult.savedFiles?.length ? (
+                      <div className="admin-saved-files">
+                        <strong>服务器已保存</strong>
+                        {cleaningResult.savedFiles.map(file => (
+                          <p key={`${file.kind}-${file.path}`}>
+                            <span>{file.kind === 'cleaned' ? '清洗结果' : '原始文件'}</span>
+                            <code>{file.path}</code>
+                          </p>
+                        ))}
+                      </div>
+                    ) : null}
+                    {cleaningResult.mode === 'cleaned' ? (
+                      <>
+                        <div className="admin-cleaning-actions">
+                          <button type="button" onClick={handleDownloadCleaningResult}>
+                            <Download />
+                            <span>下载清洗结果</span>
+                          </button>
+                        </div>
+                        <textarea readOnly value={cleaningResult.text} aria-label="清洗后的文本" />
+                      </>
+                    ) : (
+                      <div className="admin-cleaning-guidance">
+                        <strong>{cleaningResult.message}</strong>
+                        <ol>
+                          {cleaningResult.suggestedSteps.map(step => (
+                            <li key={step}>{step}</li>
+                          ))}
+                        </ol>
+                      </div>
+                    )}
+                  </div>
+                ) : null}
+              </div>
+            </div>
+
             <div className="admin-panel">
               <div className="admin-panel-head">
                 <span>任务记录</span>
@@ -848,7 +1108,7 @@ export default function AdminDashboard({ onRequireLogin, onBackHome }: AdminDash
           </motion.section>
         ) : null}
 
-        {activeTab === 'audit' ? (
+        {activeTab === 'audit' && canViewAudit ? (
           <motion.section
             className="admin-view admin-panel"
             initial={{ opacity: 0, y: 16 }}
@@ -880,7 +1140,7 @@ export default function AdminDashboard({ onRequireLogin, onBackHome }: AdminDash
           </motion.section>
         ) : null}
 
-        {activeTab === 'ragflow' ? (
+        {activeTab === 'ragflow' && visibleTabs.some(tab => tab.id === 'ragflow') ? (
           <motion.section
             className="admin-view admin-ragflow"
             initial={{ opacity: 0, y: 16 }}
@@ -960,9 +1220,7 @@ export default function AdminDashboard({ onRequireLogin, onBackHome }: AdminDash
                   <span>角色</span>
                   <select
                     value={userForm.role}
-                    onChange={event =>
-                      setUserForm({ ...userForm, role: event.target.value as AdminRole })
-                    }
+                    onChange={event => handleUserRoleChange(event.target.value as AdminRole)}
                   >
                     <option value="viewer">观察员</option>
                     <option value="admin">管理员</option>
@@ -993,6 +1251,22 @@ export default function AdminDashboard({ onRequireLogin, onBackHome }: AdminDash
                     placeholder={userEditorMode === 'create' ? '至少 6 位' : '留空则不修改'}
                   />
                 </label>
+                <div className="admin-permission-field">
+                  <span>后台权限</span>
+                  <div className="admin-permission-options">
+                    {configurableAdminTabs.map(tab => (
+                      <label key={tab.id}>
+                        <input
+                          type="checkbox"
+                          checked={userForm.menuPermissions.includes(tab.id)}
+                          disabled={userForm.role !== 'admin'}
+                          onChange={() => toggleUserPermission(tab.id)}
+                        />
+                        <span>{menuPermissionLabel(tab.id)}</span>
+                      </label>
+                    ))}
+                  </div>
+                </div>
                 <label>
                   <span>邮箱</span>
                   <input

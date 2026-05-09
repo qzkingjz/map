@@ -164,7 +164,7 @@ export default function App() {
         setAuthUser(user);
         setAuthStatus('authenticated');
 
-        if (route === '/admin' && user.role !== 'super_admin') {
+        if (route === '/admin' && user.role !== 'super_admin' && user.role !== 'admin') {
           navigate('/', { authenticatedEntry: true }, { replace: true });
         }
       } catch {
@@ -199,9 +199,10 @@ export default function App() {
         onLogin={user => {
           setAuthUser(user);
           setAuthStatus('authenticated');
+          const canEnterAdmin = user.role === 'super_admin' || user.role === 'admin';
           navigate(
-            user.role === 'super_admin' ? '/admin' : '/',
-            user.role === 'super_admin' ? {} : { authenticatedEntry: true }
+            canEnterAdmin ? '/admin' : '/',
+            canEnterAdmin ? {} : { authenticatedEntry: true }
           );
         }}
         onBackHome={() => navigate('/login')}

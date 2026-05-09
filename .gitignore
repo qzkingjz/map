@@ -8,4 +8,5 @@ coverage/
 !.env.example
 process-test.txt
 npm-version-*.txt
-{console.error(e)
+data/
+[{]console.error(e)

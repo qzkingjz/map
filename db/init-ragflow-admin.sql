@@ -23,6 +23,7 @@ CREATE TABLE IF NOT EXISTS users (
   status ENUM('active', 'disabled') NOT NULL DEFAULT 'active',
   email VARCHAR(255) NULL,
   phone VARCHAR(32) NULL,
+  menu_permissions JSON NULL,
   last_login_at DATETIME NULL,
   last_login_ip VARCHAR(64) NULL,
   created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,

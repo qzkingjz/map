@@ -1,6 +1,7 @@
 import dotenv from "dotenv";
 import express from "express";
 import crypto from "node:crypto";
+import fs from "node:fs/promises";
 import mysql, { type Pool, type ResultSetHeader, type RowDataPacket } from "mysql2/promise";
 import OpenAI from "openai";
 import path from "path";
@@ -90,6 +91,41 @@ interface TavilySearchResult {
   images?: Array<{ url?: string } | string>;
 }
 
+interface TextCleaningStats {
+  originalLength: number;
+  cleanedLength: number;
+  removedCharacters: number;
+  removedLines: number;
+  dedupedLines: number;
+}
+
+interface TextCleaningResult {
+  text: string;
+  stats: TextCleaningStats;
+}
+
+type CleaningUploadMode = "cleaned" | "ragflow_parse_required" | "unsupported";
+
+interface UploadedCleaningFile {
+  filename: string;
+  mimeType: string;
+  buffer: Buffer;
+}
+
+interface SavedCleaningFile {
+  kind: "original" | "cleaned";
+  filename: string;
+  path: string;
+  bytes: number;
+}
+
+interface CleaningUploadDecision {
+  mode: CleaningUploadMode;
+  documentType: string;
+  message: string;
+  suggestedSteps: string[];
+}
+
 interface NewsArticleSummary {
   display_title: string;
   source_name: string;
@@ -167,6 +203,13 @@ const newsSearchConfig = {
     process.env.BING_NEWS_SEARCH_ENDPOINT?.trim() ||
     "https://api.bing.microsoft.com/v7.0/news/search",
   market: process.env.BING_NEWS_SEARCH_MARKET?.trim() || "zh-CN",
+};
+
+const dataCleaningConfig = {
+  enabled: process.env.DATA_CLEANING_ENABLED?.trim().toLowerCase() !== "false",
+  maxChars: Number(process.env.DATA_CLEANING_MAX_CHARS ?? 12_000),
+  uploadMaxBytes: Number(process.env.DATA_CLEANING_UPLOAD_MAX_BYTES ?? 5 * 1024 * 1024),
+  storageDir: path.resolve(process.env.DATA_CLEANING_STORAGE_DIR?.trim() || "data/cleaning-uploads"),
 };
 
 const defaultChineseNewsDomains = [
@@ -1211,6 +1254,445 @@ function stripHtml(value: string): string {
   );
 }
 
+function shouldDropKnowledgeLine(line: string): boolean {
+  const compact = line.replace(/\s+/g, "");
+  if (!compact) return true;
+  if (/^https?:\/\/\S+$/i.test(compact)) return true;
+  if (
+    /^(\u4E0A\u4E00\u7BC7|\u4E0B\u4E00\u7BC7|\u76F8\u5173\u9605\u8BFB|\u8FD4\u56DE\u9996\u9875|\u6253\u5370|\u5173\u95ED|\u6536\u85CF|\u5206\u4EAB\u5230|\u5FAE\u4FE1|\u5FAE\u535A)$/u.test(compact)
+  ) {
+    return true;
+  }
+  if (/^(All rights reserved|Copyright)\b/i.test(line)) return true;
+  if (/^(\u8D23\u4EFB\u7F16\u8F91|\u7F16\u8F91|\u4F5C\u8005)[:\uFF1A]/u.test(compact) && compact.length <= 28) return true;
+  if (/^(\u6765\u6E90|\u53D1\u5E03\u65F6\u95F4|\u53D1\u8868\u65F6\u95F4|\u53D1\u5E03\u65E5\u671F)[:\uFF1A]/u.test(compact) && compact.length <= 36) return true;
+  if (/^[\-_=*#~\u00B7.\u3002]{3,}$/.test(compact)) return true;
+  return false;
+}
+
+function cleanKnowledgeText(value?: string | null): TextCleaningResult {
+  const original = typeof value === "string" ? value : "";
+  const stats: TextCleaningStats = {
+    originalLength: original.length,
+    cleanedLength: 0,
+    removedCharacters: 0,
+    removedLines: 0,
+    dedupedLines: 0,
+  };
+
+  if (!original.trim()) {
+    return { text: "", stats };
+  }
+
+  let text = original
+    .replace(/^\uFEFF/, "")
+    .replace(/[\u200B-\u200D\u2060]/g, "")
+    .replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, "")
+    .replace(/<script[\s\S]*?<\/script>/gi, " ")
+    .replace(/<style[\s\S]*?<\/style>/gi, " ")
+    .replace(/<br\s*\/?>/gi, "\n")
+    .replace(/<\/(p|div|section|article|li|tr|h[1-6])>/gi, "\n")
+    .replace(/<[^>]+>/g, " ");
+
+  text = decodeXmlText(text)
+    .replace(/!\[([^\]]*)\]\([^)]+\)/g, "$1")
+    .replace(/\[([^\]]+)\]\([^)]+\)/g, "$1")
+    .replace(/[ \t\u00A0]+/g, " ")
+    .replace(/\r\n?/g, "\n")
+    .replace(/\n[ \t]+/g, "\n");
+
+  const seenLines = new Set<string>();
+  const lines = text.split("\n");
+  const cleanedLines: string[] = [];
+
+  for (const rawLine of lines) {
+    const line = rawLine
+      .replace(/[ \t]{2,}/g, " ")
+      .replace(/\s+([\uFF0C\u3002\uFF01\uFF1F\uFF1B\uFF1A\u3001,.!?;:])/g, "$1")
+      .trim();
+    const compact = line.replace(/\s+/g, "");
+
+    if (shouldDropKnowledgeLine(line)) {
+      stats.removedLines += 1;
+      continue;
+    }
+
+    if (compact.length >= 8 && seenLines.has(compact)) {
+      stats.dedupedLines += 1;
+      continue;
+    }
+
+    if (compact.length >= 8) {
+      seenLines.add(compact);
+    }
+
+    cleanedLines.push(line);
+  }
+
+  text = cleanedLines
+    .join("\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+
+  const maxChars = Number.isFinite(dataCleaningConfig.maxChars)
+    ? Math.max(1_000, dataCleaningConfig.maxChars)
+    : 12_000;
+  if (text.length > maxChars) {
+    text = text.slice(0, maxChars).trim();
+  }
+
+  stats.cleanedLength = text.length;
+  stats.removedCharacters = Math.max(0, stats.originalLength - stats.cleanedLength);
+  return { text, stats };
+}
+
+function maybeCleanKnowledgeText(value?: string | null): TextCleaningResult {
+  if (dataCleaningConfig.enabled) {
+    return cleanKnowledgeText(value);
+  }
+
+  const text = typeof value === "string" ? value.trim() : "";
+  return {
+    text,
+    stats: {
+      originalLength: typeof value === "string" ? value.length : 0,
+      cleanedLength: text.length,
+      removedCharacters: Math.max(0, (typeof value === "string" ? value.length : 0) - text.length),
+      removedLines: 0,
+      dedupedLines: 0,
+    },
+  };
+}
+
+function emptyCleaningStats(originalLength = 0): TextCleaningStats {
+  return {
+    originalLength,
+    cleanedLength: 0,
+    removedCharacters: originalLength,
+    removedLines: 0,
+    dedupedLines: 0,
+  };
+}
+
+function sanitizeStorageFilename(filename: string): string {
+  const fallback = "uploaded-file";
+  const normalized = path.basename(filename || fallback).replace(/[<>:"/\\|?*\x00-\x1F]/g, "_");
+  const compact = normalized.replace(/\s+/g, " ").trim();
+  return (compact || fallback).slice(0, 160);
+}
+
+function cleanedStorageFilename(filename: string): string {
+  const safeName = sanitizeStorageFilename(filename);
+  const extension = path.extname(safeName);
+  const baseName = extension ? safeName.slice(0, -extension.length) : safeName;
+  return extension ? `${baseName}.cleaned${extension}` : `${baseName}.cleaned.txt`;
+}
+
+function uploadStorageSubdir(): string {
+  return new Date().toISOString().slice(0, 10);
+}
+
+async function saveCleaningBuffer(
+  filename: string,
+  buffer: Buffer,
+  kind: SavedCleaningFile["kind"]
+): Promise<SavedCleaningFile> {
+  const directory = path.join(dataCleaningConfig.storageDir, uploadStorageSubdir());
+  await fs.mkdir(directory, { recursive: true });
+
+  const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+  const nonce = crypto.randomBytes(4).toString("hex");
+  const safeFilename = sanitizeStorageFilename(filename);
+  const storedFilename = `${stamp}-${nonce}-${safeFilename}`;
+  const fullPath = path.join(directory, storedFilename);
+  await fs.writeFile(fullPath, buffer);
+
+  return {
+    kind,
+    filename: storedFilename,
+    path: fullPath,
+    bytes: buffer.length,
+  };
+}
+
+function decodeHeaderValue(value: string): string {
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    return value;
+  }
+}
+
+function parseContentDispositionFilename(value?: string): string | null {
+  if (!value) return null;
+
+  const encoded = value.match(/filename\*=UTF-8''([^;\r\n]+)/i);
+  if (encoded) {
+    return path.basename(decodeHeaderValue(encoded[1].replace(/^"|"$/g, "")));
+  }
+
+  const plain = value.match(/filename="([^"]+)"|filename=([^;\r\n]+)/i);
+  const filename = plain?.[1] ?? plain?.[2];
+  return filename ? path.basename(filename.trim()) : null;
+}
+
+function parseMultipartCleaningFile(contentType: string, body: Buffer): UploadedCleaningFile | null {
+  const boundaryMatch = contentType.match(/boundary=(?:"([^"]+)"|([^;]+))/i);
+  const boundary = boundaryMatch?.[1] ?? boundaryMatch?.[2];
+  if (!boundary) return null;
+
+  const delimiter = Buffer.from(`--${boundary}`);
+  let cursor = body.indexOf(delimiter);
+
+  while (cursor >= 0) {
+    cursor += delimiter.length;
+    if (body[cursor] === 45 && body[cursor + 1] === 45) break;
+    if (body[cursor] === 13 && body[cursor + 1] === 10) cursor += 2;
+
+    const headerEnd = body.indexOf(Buffer.from("\r\n\r\n"), cursor);
+    if (headerEnd < 0) break;
+
+    const headersText = body.slice(cursor, headerEnd).toString("utf8");
+    const headers = new Map<string, string>();
+    for (const line of headersText.split("\r\n")) {
+      const separator = line.indexOf(":");
+      if (separator <= 0) continue;
+      headers.set(line.slice(0, separator).trim().toLowerCase(), line.slice(separator + 1).trim());
+    }
+
+    const contentStart = headerEnd + 4;
+    const nextBoundary = body.indexOf(Buffer.from(`\r\n--${boundary}`), contentStart);
+    if (nextBoundary < 0) break;
+
+    const disposition = headers.get("content-disposition");
+    const filename = parseContentDispositionFilename(disposition);
+    const fieldName = disposition?.match(/name="([^"]+)"/i)?.[1];
+    if (filename || fieldName === "file" || fieldName === "text") {
+      const fallbackName = fieldName === "text" ? "uploaded.txt" : "uploaded-file";
+      return {
+        filename: filename || fallbackName,
+        mimeType: headers.get("content-type") || "text/plain",
+        buffer: body.slice(contentStart, nextBoundary),
+      };
+    }
+
+    cursor = body.indexOf(delimiter, nextBoundary);
+  }
+
+  return null;
+}
+
+function readHeaderString(value: string | string[] | undefined): string | undefined {
+  return Array.isArray(value) ? value[0] : value;
+}
+
+function readQueryString(value: unknown): string | undefined {
+  return typeof value === "string" && value.trim() ? value.trim() : undefined;
+}
+
+function readUploadedCleaningFile(req: express.Request): UploadedCleaningFile | null {
+  const body = Buffer.isBuffer(req.body) ? req.body : null;
+  if (!body || body.length === 0) return null;
+
+  const contentType = readHeaderString(req.headers["content-type"]) ?? "";
+  if (contentType.toLowerCase().includes("multipart/form-data")) {
+    return parseMultipartCleaningFile(contentType, body);
+  }
+
+  return {
+    filename:
+      path.basename(
+        readQueryString(req.query.filename) ||
+          decodeHeaderValue(readHeaderString(req.headers["x-filename"]) ?? "")
+      ) || "uploaded.txt",
+    mimeType: contentType.split(";")[0]?.trim() || "application/octet-stream",
+    buffer: body,
+  };
+}
+
+function isSupportedTextUpload(file: UploadedCleaningFile): boolean {
+  const extension = path.extname(file.filename).toLowerCase();
+  const mimeType = file.mimeType.toLowerCase();
+  const supportedExtensions = new Set([
+    ".txt",
+    ".md",
+    ".markdown",
+    ".csv",
+    ".tsv",
+    ".json",
+    ".jsonl",
+    ".html",
+    ".htm",
+    ".xml",
+    ".yaml",
+    ".yml",
+    ".log",
+    ".sql",
+  ]);
+
+  if (supportedExtensions.has(extension)) return true;
+  if (mimeType.startsWith("text/")) return true;
+  return /(json|xml|yaml|javascript|x-www-form-urlencoded)/i.test(mimeType);
+}
+
+function cleaningUploadDecision(file: UploadedCleaningFile): CleaningUploadDecision {
+  const extension = path.extname(file.filename).toLowerCase();
+  const mimeType = file.mimeType.toLowerCase();
+  const signature = file.buffer.subarray(0, 8).toString("latin1");
+
+  if (signature.startsWith("%PDF") || extension === ".pdf" || mimeType.includes("pdf")) {
+    return {
+      mode: "ragflow_parse_required",
+      documentType: "pdf",
+      message: "PDF 需要先解析成文本，再做轻量清洗。",
+      suggestedSteps: [
+        "先把原始 PDF 上传到 RAGFlow 知识库，让 RAGFlow 完成解析。",
+        "如果是扫描件或图片型 PDF，需要先做 OCR，或使用 RAGFlow 的 OCR/解析能力。",
+        "解析后重点检查页眉页脚、页码、水印、断行错乱和 OCR 错字。",
+        "如果能导出解析后的文本或 Markdown，再上传到这里做轻量清洗。",
+      ],
+    };
+  }
+
+  if (
+    [".xlsx", ".xls", ".xlsm"].includes(extension) ||
+    mimeType.includes("spreadsheet") ||
+    mimeType.includes("excel")
+  ) {
+    return {
+      mode: "ragflow_parse_required",
+      documentType: "spreadsheet",
+      message: "表格文件需要先做表格结构解析，再做轻量清洗。",
+      suggestedSteps: [
+        "先把 XLSX/XLS 上传到 RAGFlow，或把重要 sheet 导出为 CSV/Markdown。",
+        "检查 sheet 名、表头、合并单元格、空行空列是否被正确保留。",
+        "重要表格建议一个 sheet 或一个 Markdown 段落只放一张表。",
+        "如需二次清洗，可把导出的 CSV/Markdown 上传到这里。",
+      ],
+    };
+  }
+
+  if (
+    [".doc", ".docx"].includes(extension) ||
+    mimeType.includes("wordprocessingml") ||
+    mimeType.includes("msword")
+  ) {
+    return {
+      mode: "ragflow_parse_required",
+      documentType: "word",
+      message: "Word 文档需要先解析标题、段落和表格结构。",
+      suggestedSteps: [
+        "先把 DOC/DOCX 上传到 RAGFlow，让它解析标题、正文、表格和脚注。",
+        "检查标题层级、表格、脚注、页眉页脚是否抽取正确。",
+        "如需二次清洗，可导出解析后的文本或 Markdown 再上传到这里。",
+      ],
+    };
+  }
+
+  if (
+    [".ppt", ".pptx"].includes(extension) ||
+    mimeType.includes("presentationml") ||
+    mimeType.includes("powerpoint")
+  ) {
+    return {
+      mode: "ragflow_parse_required",
+      documentType: "presentation",
+      message: "演示文稿需要先按幻灯片结构解析。",
+      suggestedSteps: [
+        "先把 PPT/PPTX 上传到 RAGFlow，让它解析幻灯片文字和备注。",
+        "检查标题、项目符号顺序、备注和页码是否保留正确。",
+        "如需二次清洗，可导出解析后的文本或 Markdown 再上传到这里。",
+      ],
+    };
+  }
+
+  if (mimeType.startsWith("image/") || [".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff"].includes(extension)) {
+    return {
+      mode: "ragflow_parse_required",
+      documentType: "image",
+      message: "图片需要先 OCR 成文本，再做轻量清洗。",
+      suggestedSteps: [
+        "先使用 RAGFlow OCR/解析能力，或其他 OCR 工具提取图片文字。",
+        "检查 OCR 结果中的识别错误、漏列、阅读顺序错误。",
+        "如需二次清洗，可把 OCR 文本上传到这里。",
+      ],
+    };
+  }
+
+  if (
+    [".zip", ".rar", ".7z", ".tar", ".gz", ".tgz", ".bz2"].includes(extension) ||
+    mimeType.includes("zip") ||
+    mimeType.includes("rar") ||
+    mimeType.includes("7z") ||
+    mimeType.includes("x-tar") ||
+    mimeType.includes("gzip")
+  ) {
+    return {
+      mode: "ragflow_parse_required",
+      documentType: "archive",
+      message: "这是一份压缩文件，无法直接做轻量清洗。",
+      suggestedSteps: [
+        "原始压缩文件已保存到服务器。",
+        "请先解压压缩包，再按文件类型分别上传 PDF、Word、Excel、图片或文本文件。",
+        "如果压缩包内文件较多，建议先筛选出需要进入知识库的文件，避免无关附件进入 RAGFlow。",
+        "解压后的文本、CSV、Markdown、HTML 可以在这里直接清洗；PDF、Office、图片需要先解析或 OCR。",
+      ],
+    };
+  }
+
+  if (isSupportedTextUpload(file)) {
+    return {
+      mode: "cleaned",
+      documentType: "text",
+      message: "文本类文件已直接完成轻量清洗。",
+      suggestedSteps: [],
+    };
+  }
+
+  if (looksLikeBinary(file.buffer)) {
+    return {
+      mode: "unsupported",
+      documentType: extension ? extension.slice(1) : "binary",
+      message: "该二进制文件类型不能直接做轻量清洗。",
+      suggestedSteps: [
+        "如果 RAGFlow 支持该格式，请先上传到 RAGFlow 解析。",
+        "否则请先转换或导出为文本、Markdown、CSV 或 HTML，再使用这里的清洗功能。",
+      ],
+    };
+  }
+
+  return {
+    mode: "cleaned",
+    documentType: "plain-text",
+    message: "文件内容看起来是纯文本，已直接完成轻量清洗。",
+    suggestedSteps: [],
+  };
+}
+
+function looksLikeBinary(buffer: Buffer): boolean {
+  if (buffer.length === 0) return false;
+  if (buffer.includes(0)) return true;
+
+  const sample = buffer.subarray(0, Math.min(buffer.length, 4096));
+  let controlCount = 0;
+  for (const byte of sample) {
+    const allowedControl = byte === 9 || byte === 10 || byte === 13;
+    if (byte < 32 && !allowedControl) {
+      controlCount += 1;
+    }
+  }
+
+  return controlCount / sample.length > 0.02;
+}
+
+function extractTextFromCleaningUpload(file: UploadedCleaningFile): string {
+  if (looksLikeBinary(file.buffer)) {
+    throw new Error("Unsupported binary file type for lightweight cleaning.");
+  }
+
+  return new TextDecoder("utf-8", { fatal: false }).decode(file.buffer);
+}
+
 function resolveArticleUrl(href: string, baseUrl: string): string | null {
   if (!href || href.startsWith("#") || href.toLowerCase().startsWith("javascript:")) {
     return null;
@@ -1967,8 +2449,18 @@ async function runCollectionTask(
       const sourceUrl = article.url?.trim();
       if (!title || !sourceUrl) continue;
 
+      const excerptCleaning = maybeCleanKnowledgeText(article.content ?? title);
+      const rawContentCleaning = maybeCleanKnowledgeText(
+        article.raw_content ?? article.content ?? title
+      );
+      const cleanedArticle: GdeltArticle = {
+        ...article,
+        content: excerptCleaning.text || title,
+        raw_content: rawContentCleaning.text || null,
+      };
+
       const contentHash = hashToken(`${title}\n${sourceUrl}`);
-      const summary = await summarizeNewsArticle(article, keyword);
+      const summary = await summarizeNewsArticle(cleanedArticle, keyword);
       summarized += 1;
       const mappedSourceName = sourceDisplayName(sourceUrl || article.domain);
       const displaySourceName =
@@ -2017,17 +2509,17 @@ async function runCollectionTask(
           displayTitle,
           displaySourceName,
           sourceUrl,
-          toMysqlDate(parseGdeltDate(article.seendate)),
-          article.socialimage ?? null,
-          article.content ?? title,
-          article.raw_content ?? null,
+          toMysqlDate(parseGdeltDate(cleanedArticle.seendate)),
+          cleanedArticle.socialimage ?? null,
+          cleanedArticle.content ?? title,
+          cleanedArticle.raw_content ?? null,
           displaySummary,
           JSON.stringify(displayPoints),
           JSON.stringify(displayRegions),
           JSON.stringify(displayPeople),
           JSON.stringify(displayOrganizations),
           JSON.stringify(displayTags),
-          article.language ?? null,
+          cleanedArticle.language ?? null,
           summary.importance,
           contentHash,
         ]
@@ -2064,6 +2556,15 @@ async function runCollectionTask(
 }
 
 type AdminRole = "super_admin" | "admin" | "viewer";
+type AdminPermission = "overview" | "users" | "collection" | "audit" | "ragflow";
+
+const adminPermissions: AdminPermission[] = [
+  "overview",
+  "users",
+  "collection",
+  "audit",
+  "ragflow",
+];
 
 interface AdminUser {
   id: number;
@@ -2071,6 +2572,7 @@ interface AdminUser {
   displayName: string;
   role: AdminRole;
   status: "active" | "disabled";
+  menuPermissions: AdminPermission[];
 }
 
 interface AdminRequest extends express.Request {
@@ -2155,13 +2657,41 @@ function getCookie(req: express.Request, name: string): string | undefined {
     ?.slice(name.length + 1);
 }
 
+function normalizeAdminPermissionArray(value: unknown, role: AdminRole): AdminPermission[] {
+  if (role === "super_admin") return [...adminPermissions];
+  if (role === "viewer") return [];
+
+  const rawItems = (() => {
+    if (Array.isArray(value)) return value;
+    if (typeof value === "string" && value.trim()) {
+      try {
+        const parsed = JSON.parse(value);
+        return Array.isArray(parsed) ? parsed : [];
+      } catch {
+        return value.split(",");
+      }
+    }
+    return [];
+  })();
+
+  const allowed = new Set<AdminPermission>(adminPermissions);
+  const normalized = rawItems.filter((item): item is AdminPermission =>
+    typeof item === "string" && allowed.has(item as AdminPermission)
+  );
+
+  return [...new Set(normalized)];
+}
+
 function normalizeAdminUser(row: RowDataPacket): AdminUser {
+  const role: AdminRole =
+    row.role === "super_admin" || row.role === "viewer" ? row.role : "admin";
   return {
     id: Number(row.id),
     username: String(row.username),
     displayName: String(row.display_name ?? row.username),
-    role: row.role === "super_admin" || row.role === "viewer" ? row.role : "admin",
+    role,
     status: row.status === "disabled" ? "disabled" : "active",
+    menuPermissions: normalizeAdminPermissionArray(row.menu_permissions, role),
   };
 }
 
@@ -2203,6 +2733,21 @@ async function ensureAdminBootstrap(): Promise<void> {
   }
 
   const pool = getAdminDbPool();
+  const [permissionColumns] = await pool.execute<RowDataPacket[]>(
+    `SELECT COLUMN_NAME
+     FROM INFORMATION_SCHEMA.COLUMNS
+     WHERE TABLE_SCHEMA = DATABASE()
+       AND TABLE_NAME = 'users'
+       AND COLUMN_NAME = 'menu_permissions'
+     LIMIT 1`
+  );
+  if (!permissionColumns[0]) {
+    await pool.execute(
+      `ALTER TABLE users
+       ADD COLUMN menu_permissions JSON NULL AFTER phone`
+    );
+  }
+
   const [rows] = await pool.query<RowDataPacket[]>("SELECT COUNT(*) AS count FROM users");
   const count = Number(rows[0]?.count ?? 0);
 
@@ -2258,7 +2803,7 @@ async function readSessionAdminUser(req: express.Request): Promise<AdminUser | n
 
   const pool = getAdminDbPool();
   const [rows] = await pool.execute<RowDataPacket[]>(
-    `SELECT u.id, u.username, u.display_name, u.role, u.status
+    `SELECT u.id, u.username, u.display_name, u.role, u.status, u.menu_permissions
      FROM auth_sessions s
      INNER JOIN users u ON u.id = s.user_id
      WHERE s.session_token_hash = ?
@@ -2284,6 +2829,39 @@ function requireSuperAdmin(
   return next();
 }
 
+function requireAdminPageAccess(
+  req: AdminRequest,
+  res: express.Response,
+  next: express.NextFunction
+) {
+  if (req.adminUser?.role !== "super_admin" && req.adminUser?.role !== "admin") {
+    return res.status(403).json({ error: "Administrator access is required" });
+  }
+
+  return next();
+}
+
+function hasAdminPermission(user: AdminUser | undefined, permission: AdminPermission): boolean {
+  if (!user) return false;
+  if (user.role === "super_admin") return true;
+  if (user.role !== "admin") return false;
+  return user.menuPermissions.includes(permission);
+}
+
+function requireAdminPermission(permission: AdminPermission) {
+  return (
+    req: AdminRequest,
+    res: express.Response,
+    next: express.NextFunction
+  ) => {
+    if (!hasAdminPermission(req.adminUser, permission)) {
+      return res.status(403).json({ error: "Permission denied" });
+    }
+
+    return next();
+  };
+}
+
 function publicAdminUser(user: AdminUser) {
   return {
     id: user.id,
@@ -2291,6 +2869,7 @@ function publicAdminUser(user: AdminUser) {
     displayName: user.displayName,
     role: user.role,
     status: user.status,
+    menuPermissions: user.menuPermissions,
   };
 }
 
@@ -2306,6 +2885,14 @@ function readAdminRole(value: unknown): AdminRole | null {
 
 function readAdminStatus(value: unknown): "active" | "disabled" | null {
   return value === "active" || value === "disabled" ? value : null;
+}
+
+function readMenuPermissions(value: unknown, role: AdminRole): AdminPermission[] {
+  const permissions = normalizeAdminPermissionArray(value, role);
+  if (role === "admin" && permissions.length === 0) {
+    return ["collection"];
+  }
+  return permissions;
 }
 
 async function countActiveSuperAdmins(excludeUserId?: number): Promise<number> {
@@ -2448,7 +3035,7 @@ function registerAdminRoutes(app: express.Express) {
 
       const pool = getAdminDbPool();
       const [rows] = await pool.execute<RowDataPacket[]>(
-        `SELECT id, username, display_name, password_hash, role, status
+        `SELECT id, username, display_name, password_hash, role, status, menu_permissions
          FROM users
          WHERE username = ?
          LIMIT 1`,
@@ -2633,9 +3220,9 @@ function registerAdminRoutes(app: express.Express) {
     }
   });
 
-  app.use("/api/admin", requireAdminSession, requireSuperAdmin);
+  app.use("/api/admin", requireAdminSession, requireAdminPageAccess);
 
-  app.get("/api/admin/summary", async (_req, res) => {
+  app.get("/api/admin/summary", requireAdminPermission("overview"), async (_req, res) => {
     try {
       const pool = getAdminDbPool();
       const [[userCounts], [sessionCounts], [auditCounts], [settings]] =
@@ -2683,18 +3270,28 @@ function registerAdminRoutes(app: express.Express) {
     }
   });
 
-  app.get("/api/admin/users", async (_req, res) => {
+  app.get("/api/admin/users", requireSuperAdmin, async (_req, res) => {
     try {
       const [rows] = await getAdminDbPool().query<RowDataPacket[]>(
         `SELECT
           id, username, display_name AS displayName, role, status,
+          menu_permissions AS menuPermissions,
           email, phone, last_login_at AS lastLoginAt, last_login_ip AS lastLoginIp,
           created_at AS createdAt
          FROM users
          ORDER BY id ASC`
       );
 
-      return res.json({ users: rows });
+      return res.json({
+        users: rows.map((row) => {
+          const role: AdminRole =
+            row.role === "super_admin" || row.role === "viewer" ? row.role : "admin";
+          return {
+            ...row,
+            menuPermissions: normalizeAdminPermissionArray(row.menuPermissions, role),
+          };
+        }),
+      });
     } catch (error) {
       return res.status(getStatusCode(error)).json({
         error: "Failed to load users",
@@ -2703,7 +3300,7 @@ function registerAdminRoutes(app: express.Express) {
     }
   });
 
-  app.post("/api/admin/collection/run", async (req: AdminRequest, res) => {
+  app.post("/api/admin/collection/run", requireAdminPermission("collection"), async (req: AdminRequest, res) => {
     const keyword = readOptionalString(req.body?.keyword);
     const timeRangeDays = clampInteger(req.body?.timeRangeDays, 7, 1, 30);
     const maxRecords = clampInteger(req.body?.maxRecords, 20, 1, 50);
@@ -2757,7 +3354,7 @@ function registerAdminRoutes(app: express.Express) {
     }
   });
 
-  app.get("/api/admin/collection/tasks", async (_req, res) => {
+  app.get("/api/admin/collection/tasks", requireAdminPermission("collection"), async (_req, res) => {
     try {
       await getAdminDbPool().execute(
         `UPDATE collection_tasks
@@ -2791,7 +3388,7 @@ function registerAdminRoutes(app: express.Express) {
     }
   });
 
-  app.get("/api/admin/collection/articles", async (_req, res) => {
+  app.get("/api/admin/collection/articles", requireAdminPermission("collection"), async (_req, res) => {
     try {
       const [rows] = await getAdminDbPool().query<RowDataPacket[]>(
         `SELECT
@@ -2817,7 +3414,7 @@ function registerAdminRoutes(app: express.Express) {
     }
   });
 
-  app.patch("/api/admin/collection/articles/:id", async (req: AdminRequest, res) => {
+  app.patch("/api/admin/collection/articles/:id", requireAdminPermission("collection"), async (req: AdminRequest, res) => {
     try {
       const articleId = Number(req.params.id);
       const status = req.body?.status;
@@ -2850,13 +3447,14 @@ function registerAdminRoutes(app: express.Express) {
     }
   });
 
-  app.post("/api/admin/users", async (req: AdminRequest, res) => {
+  app.post("/api/admin/users", requireSuperAdmin, async (req: AdminRequest, res) => {
     try {
       const username = readOptionalString(req.body?.username);
       const displayName = readOptionalString(req.body?.displayName);
       const password = typeof req.body?.password === "string" ? req.body.password : "";
       const role = readAdminRole(req.body?.role) ?? "viewer";
       const status = readAdminStatus(req.body?.status) ?? "active";
+      const menuPermissions = readMenuPermissions(req.body?.menuPermissions, role);
       const email = readOptionalString(req.body?.email);
       const phone = readOptionalString(req.body?.phone);
 
@@ -2869,16 +3467,25 @@ function registerAdminRoutes(app: express.Express) {
       const passwordHash = await hashPassword(password);
       const [result] = await getAdminDbPool().execute<ResultSetHeader>(
         `INSERT INTO users
-          (username, display_name, password_hash, role, status, email, phone)
-         VALUES (?, ?, ?, ?, ?, ?, ?)`,
-        [username, displayName, passwordHash, role, status, email, phone]
+          (username, display_name, password_hash, role, status, menu_permissions, email, phone)
+         VALUES (?, ?, ?, ?, ?, CAST(? AS JSON), ?, ?)`,
+        [
+          username,
+          displayName,
+          passwordHash,
+          role,
+          status,
+          JSON.stringify(menuPermissions),
+          email,
+          phone,
+        ]
       );
 
       await writeAuditLog("user.create", req, {
         actorUserId: req.adminUser?.id ?? null,
         targetType: "user",
         targetId: String(result.insertId),
-        detail: { username, role, status },
+        detail: { username, role, status, menuPermissions },
       });
 
       return res.status(201).json({ id: result.insertId });
@@ -2892,7 +3499,7 @@ function registerAdminRoutes(app: express.Express) {
     }
   });
 
-  app.patch("/api/admin/users/:id", async (req: AdminRequest, res) => {
+  app.patch("/api/admin/users/:id", requireSuperAdmin, async (req: AdminRequest, res) => {
     try {
       const userId = Number(req.params.id);
       if (!Number.isInteger(userId) || userId <= 0) {
@@ -2917,6 +3524,7 @@ function registerAdminRoutes(app: express.Express) {
       const password = typeof req.body?.password === "string" ? req.body.password : "";
       const nextRole = role ?? (existingRows[0].role as AdminRole);
       const nextStatus = status ?? (existingRows[0].status as "active" | "disabled");
+      const menuPermissions = readMenuPermissions(req.body?.menuPermissions, nextRole);
 
       if (!username || !displayName || !role || !status) {
         return res.status(400).json({
@@ -2941,16 +3549,36 @@ function registerAdminRoutes(app: express.Express) {
         await getAdminDbPool().execute(
           `UPDATE users
            SET username = ?, display_name = ?, password_hash = ?, role = ?, status = ?,
-               email = ?, phone = ?
+               menu_permissions = CAST(? AS JSON), email = ?, phone = ?
            WHERE id = ?`,
-          [username, displayName, await hashPassword(password), role, status, email, phone, userId]
+          [
+            username,
+            displayName,
+            await hashPassword(password),
+            role,
+            status,
+            JSON.stringify(menuPermissions),
+            email,
+            phone,
+            userId,
+          ]
         );
       } else {
         await getAdminDbPool().execute(
           `UPDATE users
-           SET username = ?, display_name = ?, role = ?, status = ?, email = ?, phone = ?
+           SET username = ?, display_name = ?, role = ?, status = ?,
+               menu_permissions = CAST(? AS JSON), email = ?, phone = ?
            WHERE id = ?`,
-          [username, displayName, role, status, email, phone, userId]
+          [
+            username,
+            displayName,
+            role,
+            status,
+            JSON.stringify(menuPermissions),
+            email,
+            phone,
+            userId,
+          ]
         );
       }
 
@@ -2966,7 +3594,7 @@ function registerAdminRoutes(app: express.Express) {
         actorUserId: req.adminUser?.id ?? null,
         targetType: "user",
         targetId: String(userId),
-        detail: { username, role, status },
+        detail: { username, role, status, menuPermissions },
       });
 
       return res.json({ ok: true });
@@ -2980,7 +3608,7 @@ function registerAdminRoutes(app: express.Express) {
     }
   });
 
-  app.delete("/api/admin/users/:id", async (req: AdminRequest, res) => {
+  app.delete("/api/admin/users/:id", requireSuperAdmin, async (req: AdminRequest, res) => {
     try {
       const userId = Number(req.params.id);
       if (!Number.isInteger(userId) || userId <= 0) {
@@ -3025,7 +3653,7 @@ function registerAdminRoutes(app: express.Express) {
     }
   });
 
-  app.get("/api/admin/audit-logs", async (_req, res) => {
+  app.get("/api/admin/audit-logs", requireAdminPermission("audit"), async (_req, res) => {
     try {
       const [rows] = await getAdminDbPool().query<RowDataPacket[]>(
         `SELECT
@@ -3052,7 +3680,7 @@ function registerAdminRoutes(app: express.Express) {
     }
   });
 
-  app.get("/api/admin/ragflow/status", async (_req, res) => {
+  app.get("/api/admin/ragflow/status", requireAdminPermission("ragflow"), async (_req, res) => {
     const startedAt = Date.now();
 
     if (!ragflowConfig.baseURL) {
@@ -3086,6 +3714,134 @@ function registerAdminRoutes(app: express.Express) {
       });
     }
   });
+
+  app.post("/api/admin/cleaning/preview", requireAdminPermission("collection"), async (req: AdminRequest, res) => {
+    const text = readOptionalString(req.body?.text);
+    if (!text) {
+      return res.status(400).json({ error: "Text is required" });
+    }
+
+    const result = maybeCleanKnowledgeText(text);
+
+    await writeAuditLog("cleaning.preview", req, {
+      actorUserId: req.adminUser?.id ?? null,
+      targetType: "knowledge_text",
+      detail: {
+        originalLength: result.stats.originalLength,
+        cleanedLength: result.stats.cleanedLength,
+        removedLines: result.stats.removedLines,
+        dedupedLines: result.stats.dedupedLines,
+      },
+    });
+
+    return res.json({
+      enabled: dataCleaningConfig.enabled,
+      text: result.text,
+      stats: result.stats,
+    });
+  });
+
+  app.post(
+    "/api/admin/cleaning/upload",
+    requireAdminPermission("collection"),
+    express.raw({
+      type: () => true,
+      limit: Number.isFinite(dataCleaningConfig.uploadMaxBytes)
+        ? dataCleaningConfig.uploadMaxBytes
+        : 5 * 1024 * 1024,
+    }),
+    async (req: AdminRequest, res) => {
+      try {
+        const file = readUploadedCleaningFile(req);
+        if (!file) {
+          return res.status(400).json({ error: "File is required" });
+        }
+
+        const savedFiles: SavedCleaningFile[] = [
+          await saveCleaningBuffer(file.filename, file.buffer, "original"),
+        ];
+        const decision = cleaningUploadDecision(file);
+        if (decision.mode !== "cleaned") {
+          const stats = emptyCleaningStats(file.buffer.length);
+          await writeAuditLog("cleaning.upload", req, {
+            actorUserId: req.adminUser?.id ?? null,
+            targetType: "knowledge_file",
+            targetId: file.filename,
+            detail: {
+              filename: file.filename,
+              mimeType: file.mimeType,
+              bytes: file.buffer.length,
+              mode: decision.mode,
+              documentType: decision.documentType,
+              savedFiles,
+            },
+          });
+
+          return res.json({
+            enabled: dataCleaningConfig.enabled,
+            filename: file.filename,
+            mimeType: file.mimeType,
+            bytes: file.buffer.length,
+            mode: decision.mode,
+            documentType: decision.documentType,
+            message: decision.message,
+            suggestedSteps: decision.suggestedSteps,
+            savedFiles,
+            text: "",
+            stats,
+          });
+        }
+
+        const sourceText = extractTextFromCleaningUpload(file);
+        const result = maybeCleanKnowledgeText(sourceText);
+        const cleanedBuffer = Buffer.from(result.text, "utf8");
+        savedFiles.push(
+          await saveCleaningBuffer(
+            cleanedStorageFilename(file.filename),
+            cleanedBuffer,
+            "cleaned"
+          )
+        );
+
+        await writeAuditLog("cleaning.upload", req, {
+          actorUserId: req.adminUser?.id ?? null,
+          targetType: "knowledge_file",
+          targetId: file.filename,
+          detail: {
+            filename: file.filename,
+            mimeType: file.mimeType,
+            bytes: file.buffer.length,
+            mode: decision.mode,
+            documentType: decision.documentType,
+            originalLength: result.stats.originalLength,
+            cleanedLength: result.stats.cleanedLength,
+            removedLines: result.stats.removedLines,
+            dedupedLines: result.stats.dedupedLines,
+            savedFiles,
+          },
+        });
+
+        return res.json({
+          enabled: dataCleaningConfig.enabled,
+          filename: file.filename,
+          mimeType: file.mimeType,
+          bytes: file.buffer.length,
+          mode: decision.mode,
+          documentType: decision.documentType,
+          message: decision.message,
+          suggestedSteps: decision.suggestedSteps,
+          savedFiles,
+          text: result.text,
+          stats: result.stats,
+        });
+      } catch (error) {
+        return res.status(400).json({
+          error: "Failed to clean uploaded file",
+          details: getErrorMessage(error),
+        });
+      }
+    }
+  );
 }
 
 async function startServer() {
