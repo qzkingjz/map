@@ -199,6 +199,7 @@ export default function AiMapExperience({ onBack }: AiMapExperienceProps) {
         cityCount={highlightedCities.length}
         isVoiceEnabled={isVoiceEnabled}
         onToggleVoice={() => setIsVoiceEnabled(previous => !previous)}
+        isKnowledgeBaseEnabled={isKnowledgeBaseEnabled}
         theme={theme}
       />
 

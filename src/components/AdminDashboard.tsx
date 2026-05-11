@@ -61,7 +61,7 @@ const tabs: Array<{ id: AdminTab; label: string; icon: typeof LayoutDashboard }>
   { id: 'overview', label: '总览', icon: LayoutDashboard },
   { id: 'users', label: '用户', icon: UsersRound },
   { id: 'collection', label: '数据采集/清洗', icon: Newspaper },
-  { id: 'audit', label: '审计', icon: FileClock },
+  { id: 'audit', label: '系统日志', icon: FileClock },
   { id: 'ragflow', label: 'RAGFlow', icon: DatabaseZap },
 ];
 
@@ -375,7 +375,7 @@ export default function AdminDashboard({ onRequireLogin, onBackHome }: AdminDash
 
   function toggleUserPermission(permission: AdminPermission) {
     setUserForm(current => {
-      const currentPermissions = new Set(current.menuPermissions);
+      const currentPermissions = new Set<AdminPermission>(current.menuPermissions);
       if (currentPermissions.has(permission)) {
         currentPermissions.delete(permission);
       } else {
@@ -739,7 +739,7 @@ export default function AdminDashboard({ onRequireLogin, onBackHome }: AdminDash
               </div>
               <div>
                 <FileClock />
-                <span>今日审计</span>
+                <span>今日日志</span>
                 <strong>{summary?.audit.todayAuditLogs ?? '-'}</strong>
               </div>
             </section>
@@ -1117,7 +1117,7 @@ export default function AdminDashboard({ onRequireLogin, onBackHome }: AdminDash
           >
             <div className="admin-panel-head">
               <span>访问记录</span>
-              <strong>操作审计</strong>
+              <strong>系统日志</strong>
             </div>
             <div className="admin-table admin-audit-table">
               <div className="admin-table-row admin-table-head">

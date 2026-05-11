@@ -89,7 +89,7 @@ export default function LoginPage({ onLogin, onBackHome }: LoginPageProps) {
           <span>侨情数据中枢</span>
           <h1>海丝侨情与侨务治理垂直大模型门户网</h1>
           <p>
-            管理知识库连接、系统账号、访问会话与后台审计，保持侨情监测服务稳定运行。
+            管理知识库连接、系统账号、访问会话与系统日志，保持侨情监测服务稳定运行。
           </p>
         </div>
 

@@ -37,6 +37,9 @@ http://localhost:3000
 - `OPENAI_API_KEY`：基础模型 API Key
 - `OPENAI_BASE_URL`：OpenAI 兼容接口地址，例如 `https://your-endpoint/v1`
 - `OPENAI_MODEL`：用于地点抽取和坐标生成的模型
+- `OPENAI_TIMEOUT_MS`：基础模型请求超时时间，默认 `30000`
+- `OPENAI_ANSWER_TIMEOUT_MS`：大模型兜底回答超时时间，默认 `60000`
+- `OPENAI_MAX_RETRIES`：基础模型 SDK 自动重试次数，默认 `0`
 
 可选：
 
@@ -48,6 +51,28 @@ http://localhost:3000
 - `RAGFLOW_CHAT_ID`：RAGFlow chat assistant ID，不是 dataset ID
 - `RAGFLOW_MODEL`：RAGFlow 模型标识
 - `RAGFLOW_TIMEOUT_MS`：RAGFlow 请求超时时间，默认 `60000`
+- `RAGFLOW_SESSION_REUSE_ENABLED`：是否复用 RAGFlow 会话，默认 `true`
+- `RAGFLOW_SESSION_TTL_MS`：RAGFlow 会话复用时间，默认 `1800000`
+- `QUERY_CACHE_TTL_MS`：同一问题结果缓存时间，默认 `600000`
+- `QUERY_CACHE_MAX_ENTRIES`：问答缓存最大条数，默认 `120`
+- `KNOWLEDGE_FALLBACK_DELAY_MS`：知识库检索超过多久后提前启动大模型兜底，默认 `2500`
+- `LOCATION_EXTRACTION_SOFT_TIMEOUT_MS`：地点抽取最多阻塞回答多久，默认 `8000`
+
+## 问答性能优化
+
+后端问答链路做了三项优化：
+
+- 耗时日志：每次 `/api/extractCities` 请求都会输出阶段耗时，便于定位慢在知识库、模型还是缓存。
+- 并行处理：地点抽取和 RAGFlow 知识库问答会同时执行，减少串行等待。
+- 延迟兜底：知识库检索超过短阈值还没返回时，大模型回答会提前启动；知识库未命中时不再从零开始等兜底。
+- 软超时：地点抽取超时不会拖住问答主响应，超过阈值会先返回答案，地图点可为空。
+- 复用与缓存：RAGFlow session 默认短时复用，相同问题会缓存一段时间，重复查询可以更快返回。
+
+如果担心 RAGFlow 会话上下文影响不同问题，可以在 `.env` 中设置：
+
+```bash
+RAGFLOW_SESSION_REUSE_ENABLED=false
+```
 
 注意：`.env` 不要提交到 GitHub，仓库只提交 `.env.example`。
 

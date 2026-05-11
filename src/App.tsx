@@ -15,6 +15,8 @@ import QuanzhouExhibitMap, { MigrationPoint } from './components/QuanzhouExhibit
 import heritageNanyangImage from './assets/heritage-nanyang.png';
 import { AdminUser, getCurrentAdmin, logoutAdmin, recordPageView } from './lib/adminApi';
 
+const portalTitle = '海丝侨情与侨务治理垂直大模型门户网';
+
 const migrationPoints: MigrationPoint[] = [
   {
     name: '马来西亚',
@@ -245,7 +247,7 @@ export default function App() {
       <header className="qz-nav">
         <a href="#top" className="qz-brand">
           <span>泉州华侨研究</span>
-          <strong>世界泉州</strong>
+          <strong>{portalTitle}</strong>
         </a>
         <nav>
           <a href="#atlas" onClick={() => recordSectionView('时空图谱')}>
@@ -287,7 +289,7 @@ export default function App() {
           transition={{ duration: 0.7, ease: 'easeOut' }}
         >
           <span className="qz-kicker">海丝起点 · 世界侨乡 · 闽南红砖</span>
-          <h1>世界泉州</h1>
+          <h1>{portalTitle}</h1>
           <p>
             一座因海而立、因侨而兴的城市。这个数字展把泉州华侨的跨国迁徙、产业反哺、
             侨批记忆与番仔楼遗产，整理成一条可浏览、可感知的海丝叙事。

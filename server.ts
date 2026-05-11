@@ -20,6 +20,13 @@ interface CityResult {
   source?: AnswerSource;
 }
 
+interface KnownLocation {
+  name: string;
+  lat: number;
+  lng: number;
+  aliases: string[];
+}
+
 interface ExtractQueryResponse {
   answer?: string;
   answerWithReferences?: string;
@@ -48,6 +55,22 @@ interface RagflowSessionData {
 
 interface RagflowCompletionData {
   answer?: string;
+}
+
+interface QueryCacheEntry {
+  expiresAt: number;
+  value: ExtractQueryResponse;
+}
+
+interface RagflowSessionCacheEntry {
+  expiresAt: number;
+  promise: Promise<string>;
+}
+
+interface RequestTimer {
+  id: string;
+  mark: (label: string, detail?: Record<string, unknown>) => void;
+  end: (label?: string) => void;
 }
 
 interface GdeltArticle {
@@ -151,6 +174,9 @@ const foundationConfig = {
   apiKey: process.env.OPENAI_API_KEY?.trim(),
   baseURL: normalizeUrl(process.env.OPENAI_BASE_URL),
   model: process.env.OPENAI_MODEL?.trim() || "gpt-5.4",
+  timeoutMs: Number(process.env.OPENAI_TIMEOUT_MS ?? 30_000),
+  answerTimeoutMs: Number(process.env.OPENAI_ANSWER_TIMEOUT_MS ?? 60_000),
+  maxRetries: Number(process.env.OPENAI_MAX_RETRIES ?? 0),
 };
 
 const ragflowConfig = {
@@ -231,6 +257,51 @@ const defaultChineseNewsDomains = [
   "hqu.edu.cn",
 ];
 
+const knownPromptLocations: KnownLocation[] = [
+  { name: "中国", lat: 35.8617, lng: 104.1954, aliases: ["中国", "国内", "我国"] },
+  { name: "泉州", lat: 24.8741, lng: 118.6757, aliases: ["泉州", "泉州市", "刺桐城", "世界泉州"] },
+  { name: "厦门", lat: 24.4798, lng: 118.0894, aliases: ["厦门", "厦门市"] },
+  { name: "福州", lat: 26.0745, lng: 119.2965, aliases: ["福州", "福州市"] },
+  { name: "福建", lat: 26.1008, lng: 117.295, aliases: ["福建", "福建省"] },
+  { name: "北京", lat: 39.9042, lng: 116.4074, aliases: ["北京", "北京市"] },
+  { name: "上海", lat: 31.2304, lng: 121.4737, aliases: ["上海", "上海市"] },
+  { name: "广州", lat: 23.1291, lng: 113.2644, aliases: ["广州", "广州市"] },
+  { name: "深圳", lat: 22.5431, lng: 114.0579, aliases: ["深圳", "深圳市"] },
+  { name: "香港", lat: 22.3193, lng: 114.1694, aliases: ["香港"] },
+  { name: "澳门", lat: 22.1987, lng: 113.5439, aliases: ["澳门"] },
+  { name: "台北", lat: 25.033, lng: 121.5654, aliases: ["台北", "台北市"] },
+  { name: "俄罗斯", lat: 61.524, lng: 105.3188, aliases: ["俄罗斯", "俄国", "俄"] },
+  { name: "美国", lat: 37.0902, lng: -95.7129, aliases: ["美国", "美利坚", "全美"] },
+  { name: "加拿大", lat: 56.1304, lng: -106.3468, aliases: ["加拿大"] },
+  { name: "巴西", lat: -14.235, lng: -51.9253, aliases: ["巴西"] },
+  { name: "阿根廷", lat: -38.4161, lng: -63.6167, aliases: ["阿根廷"] },
+  { name: "墨西哥", lat: 23.6345, lng: -102.5528, aliases: ["墨西哥"] },
+  { name: "澳大利亚", lat: -25.2744, lng: 133.7751, aliases: ["澳大利亚", "澳洲"] },
+  { name: "新西兰", lat: -40.9006, lng: 174.886, aliases: ["新西兰"] },
+  { name: "日本", lat: 36.2048, lng: 138.2529, aliases: ["日本"] },
+  { name: "韩国", lat: 35.9078, lng: 127.7669, aliases: ["韩国", "南韩"] },
+  { name: "印度", lat: 20.5937, lng: 78.9629, aliases: ["印度"] },
+  { name: "印度尼西亚", lat: -0.7893, lng: 113.9213, aliases: ["印度尼西亚", "印尼"] },
+  { name: "马来西亚", lat: 4.2105, lng: 101.9758, aliases: ["马来西亚", "大马"] },
+  { name: "菲律宾", lat: 12.8797, lng: 121.774, aliases: ["菲律宾"] },
+  { name: "泰国", lat: 15.87, lng: 100.9925, aliases: ["泰国"] },
+  { name: "缅甸", lat: 21.9162, lng: 95.956, aliases: ["缅甸"] },
+  { name: "越南", lat: 14.0583, lng: 108.2772, aliases: ["越南"] },
+  { name: "新加坡", lat: 1.3521, lng: 103.8198, aliases: ["新加坡"] },
+  { name: "英国", lat: 55.3781, lng: -3.436, aliases: ["英国", "英格兰"] },
+  { name: "法国", lat: 46.2276, lng: 2.2137, aliases: ["法国"] },
+  { name: "德国", lat: 51.1657, lng: 10.4515, aliases: ["德国"] },
+  { name: "意大利", lat: 41.8719, lng: 12.5674, aliases: ["意大利"] },
+  { name: "西班牙", lat: 40.4637, lng: -3.7492, aliases: ["西班牙"] },
+  { name: "葡萄牙", lat: 39.3999, lng: -8.2245, aliases: ["葡萄牙"] },
+  { name: "荷兰", lat: 52.1326, lng: 5.2913, aliases: ["荷兰", "尼德兰"] },
+  { name: "南非", lat: -30.5595, lng: 22.9375, aliases: ["南非"] },
+  { name: "欧洲", lat: 54.526, lng: 15.2551, aliases: ["欧洲"] },
+  { name: "东南亚", lat: 8.0, lng: 115.0, aliases: ["东南亚", "南洋"] },
+  { name: "中东", lat: 29.2985, lng: 42.551, aliases: ["中东"] },
+  { name: "拉美", lat: -14.235, lng: -51.9253, aliases: ["拉美", "拉丁美洲"] },
+];
+
 const sourceNameByDomain: Record<string, string> = {
   "chinaqw.com": "中国侨网",
   "chinanews.com.cn": "中国新闻网",
@@ -291,6 +362,184 @@ const crawlerSources: CrawlerSource[] = [
 
 let foundationClient: OpenAI | null = null;
 let adminDbPool: Pool | null = null;
+const queryCacheTtlMs = Number(process.env.QUERY_CACHE_TTL_MS ?? 10 * 60 * 1000);
+const queryCacheMaxEntries = Number(process.env.QUERY_CACHE_MAX_ENTRIES ?? 120);
+const knowledgeFallbackDelayMs = Number(process.env.KNOWLEDGE_FALLBACK_DELAY_MS ?? 2500);
+const locationExtractionSoftTimeoutMs = Number(
+  process.env.LOCATION_EXTRACTION_SOFT_TIMEOUT_MS ?? 8000
+);
+const ragflowSessionReuseEnabled =
+  process.env.RAGFLOW_SESSION_REUSE_ENABLED?.trim().toLowerCase() !== "false";
+const ragflowSessionTtlMs = Number(process.env.RAGFLOW_SESSION_TTL_MS ?? 30 * 60 * 1000);
+const queryResponseCache = new Map<string, QueryCacheEntry>();
+const ragflowSessionCache = new Map<string, RagflowSessionCacheEntry>();
+
+function cloneQueryResponse(value: ExtractQueryResponse): ExtractQueryResponse {
+  return JSON.parse(JSON.stringify(value)) as ExtractQueryResponse;
+}
+
+function getQueryCacheKey(prompt: string, useKnowledgeBase: boolean): string {
+  return crypto
+    .createHash("sha1")
+    .update(JSON.stringify({
+      prompt: prompt.trim(),
+      useKnowledgeBase,
+      model: foundationConfig.model,
+      ragflowChatId: ragflowConfig.chatId ?? "",
+    }))
+    .digest("hex");
+}
+
+function readCachedQueryResponse(cacheKey: string): ExtractQueryResponse | null {
+  const cached = queryResponseCache.get(cacheKey);
+  if (!cached) return null;
+
+  if (cached.expiresAt <= Date.now()) {
+    queryResponseCache.delete(cacheKey);
+    return null;
+  }
+
+  return cloneQueryResponse(cached.value);
+}
+
+function writeCachedQueryResponse(cacheKey: string, value: ExtractQueryResponse) {
+  if (queryCacheTtlMs <= 0) return;
+
+  queryResponseCache.set(cacheKey, {
+    expiresAt: Date.now() + queryCacheTtlMs,
+    value: cloneQueryResponse(value),
+  });
+
+  while (queryResponseCache.size > queryCacheMaxEntries) {
+    const oldestKey = queryResponseCache.keys().next().value as string | undefined;
+    if (!oldestKey) break;
+    queryResponseCache.delete(oldestKey);
+  }
+}
+
+function createRequestTimer(scope: string): RequestTimer {
+  const id = crypto.randomUUID().slice(0, 8);
+  const startedAt = Date.now();
+  let lastMarkAt = startedAt;
+
+  const log = (label: string, detail?: Record<string, unknown>) => {
+    const now = Date.now();
+    const sinceLast = now - lastMarkAt;
+    const total = now - startedAt;
+    lastMarkAt = now;
+    const detailText = detail ? ` ${JSON.stringify(detail)}` : "";
+    console.info(`[${scope}:${id}] ${label} +${sinceLast}ms total=${total}ms${detailText}`);
+  };
+
+  log("start");
+
+  return {
+    id,
+    mark: log,
+    end: (label = "done") => log(label),
+  };
+}
+
+function createDeferredFoundationFallback(
+  prompt: string,
+  timer: RequestTimer
+): {
+  start: (reason: string) => Promise<AnswerText | null>;
+  cancel: () => void;
+} {
+  let timeout: ReturnType<typeof setTimeout> | null = null;
+  let startedPromise: Promise<AnswerText | null> | null = null;
+
+  const start = (reason: string) => {
+    if (!startedPromise) {
+      if (timeout) {
+        clearTimeout(timeout);
+        timeout = null;
+      }
+
+      timer.mark("foundation fallback start", { reason });
+      startedPromise = timed(timer, "foundation answer fallback", () =>
+        answerGeneralWithFoundation(prompt)
+      ).catch((error) => {
+        console.warn("[qiaoqing] Foundation fallback failed:", getErrorMessage(error));
+        return null;
+      });
+    }
+
+    return startedPromise;
+  };
+
+  if (knowledgeFallbackDelayMs >= 0) {
+    timeout = setTimeout(() => {
+      void start("hedged-delay");
+    }, knowledgeFallbackDelayMs);
+  }
+
+  return {
+    start,
+    cancel: () => {
+      if (timeout) {
+        clearTimeout(timeout);
+        timeout = null;
+      }
+    },
+  };
+}
+
+async function timed<T>(
+  timer: RequestTimer,
+  label: string,
+  task: () => Promise<T>
+): Promise<T> {
+  const startedAt = Date.now();
+  try {
+    const result = await task();
+    timer.mark(label, { ms: Date.now() - startedAt, ok: true });
+    return result;
+  } catch (error) {
+    timer.mark(label, {
+      ms: Date.now() - startedAt,
+      ok: false,
+      error: getErrorMessage(error),
+    });
+    throw error;
+  }
+}
+
+function withSoftTimeout<T>(
+  promise: Promise<T>,
+  timeoutMs: number,
+  fallback: T,
+  onTimeout: () => void
+): Promise<T> {
+  if (timeoutMs <= 0) {
+    return promise;
+  }
+
+  return new Promise((resolve) => {
+    let settled = false;
+    const timeout = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      onTimeout();
+      resolve(fallback);
+    }, timeoutMs);
+
+    promise
+      .then((value) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timeout);
+        resolve(value);
+      })
+      .catch(() => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timeout);
+        resolve(fallback);
+      });
+  });
+}
 
 function normalizeUrl(value?: string): string | undefined {
   const trimmed = value?.trim();
@@ -332,7 +581,8 @@ function getFoundationClient(): OpenAI {
   foundationClient = new OpenAI({
     apiKey: foundationConfig.apiKey,
     baseURL: foundationConfig.baseURL,
-    timeout: 30_000,
+    timeout: foundationConfig.timeoutMs,
+    maxRetries: foundationConfig.maxRetries,
   });
 
   return foundationClient;
@@ -371,11 +621,15 @@ function readMessageText(content: unknown): string {
 async function createChatText(
   client: OpenAI,
   model: string,
-  messages: ChatMessage[]
+  messages: ChatMessage[],
+  options: { timeoutMs?: number } = {}
 ): Promise<string> {
   const completion = await client.chat.completions.create({
     model,
     messages,
+  }, {
+    timeout: options.timeoutMs,
+    maxRetries: foundationConfig.maxRetries,
   });
 
   return readMessageText(completion.choices[0]?.message?.content);
@@ -717,6 +971,36 @@ async function createRagflowSession(sessionName: string): Promise<string> {
   return sessionId;
 }
 
+function invalidateRagflowSession(cacheKey: string) {
+  ragflowSessionCache.delete(cacheKey);
+}
+
+async function getRagflowSession(
+  cacheKey: string,
+  sessionNamePrefix: string
+): Promise<string> {
+  if (!ragflowSessionReuseEnabled) {
+    return createRagflowSession(`${sessionNamePrefix}-${Date.now()}`);
+  }
+
+  const cached = ragflowSessionCache.get(cacheKey);
+  if (cached && cached.expiresAt > Date.now()) {
+    return cached.promise;
+  }
+
+  const promise = createRagflowSession(`${sessionNamePrefix}-${Date.now()}`).catch((error) => {
+    invalidateRagflowSession(cacheKey);
+    throw error;
+  });
+
+  ragflowSessionCache.set(cacheKey, {
+    expiresAt: Date.now() + ragflowSessionTtlMs,
+    promise,
+  });
+
+  return promise;
+}
+
 function buildGeneralRagflowQuestion(prompt: string): string {
   return prompt.trim();
 }
@@ -805,6 +1089,31 @@ function dedupeCityResults(cities: CityResult[]): CityResult[] {
   });
 }
 
+function extractKnownLocationsFromPrompt(prompt: string): CityResult[] {
+  const normalizedPrompt = prompt.trim().toLowerCase();
+  const matched: CityResult[] = [];
+  const seen = new Set<string>();
+
+  knownPromptLocations.forEach((location) => {
+    const hasMatch = location.aliases.some((alias) =>
+      normalizedPrompt.includes(alias.toLowerCase())
+    );
+
+    if (!hasMatch || seen.has(location.name)) {
+      return;
+    }
+
+    seen.add(location.name);
+    matched.push({
+      name: location.name,
+      lat: location.lat,
+      lng: location.lng,
+    });
+  });
+
+  return matched;
+}
+
 function attachAnswerToCities(
   cities: CityResult[],
   answer: AnswerText,
@@ -885,23 +1194,42 @@ function buildQueryResponse(
   };
 }
 
+function buildFoundationUnavailableAnswer(useKnowledgeBase: boolean): AnswerText {
+  const message = useKnowledgeBase
+    ? "知识库暂未检索到匹配答案，大模型兜底回答超时。请稍后重试，或把问题范围缩小后再查询。"
+    : "大模型回答超时。请稍后重试，或把问题范围缩小后再查询。";
+
+  return {
+    clean: message,
+    withReferences: message,
+  };
+}
+
 async function answerGeneralWithRagflow(prompt: string): Promise<AnswerText | null> {
   if (!isRagflowEnabled()) {
     return null;
   }
 
-  const sessionId = await createRagflowSession(`map-general-${Date.now()}`);
-  const data = await requestRagflow<RagflowCompletionData>(
-    `/api/v1/chats/${ragflowConfig.chatId}/completions`,
-    {
-      method: "POST",
-      body: JSON.stringify({
-        question: buildGeneralRagflowQuestion(prompt),
-        session_id: sessionId,
-        stream: false,
-      }),
-    }
-  );
+  const cacheKey = "general";
+  const sessionId = await getRagflowSession(cacheKey, "map-general");
+  let data: RagflowCompletionData;
+
+  try {
+    data = await requestRagflow<RagflowCompletionData>(
+      `/api/v1/chats/${ragflowConfig.chatId}/completions`,
+      {
+        method: "POST",
+        body: JSON.stringify({
+          question: buildGeneralRagflowQuestion(prompt),
+          session_id: sessionId,
+          stream: false,
+        }),
+      }
+    );
+  } catch (error) {
+    invalidateRagflowSession(cacheKey);
+    throw error;
+  }
 
   const answer =
     typeof data.answer === "string" ? buildAnswerText(data.answer) : null;
@@ -919,7 +1247,8 @@ async function answerGeneralWithFoundation(
   const answer = await createChatText(
     getFoundationClient(),
     foundationConfig.model,
-    buildGeneralFoundationAnswerMessages(prompt)
+    buildGeneralFoundationAnswerMessages(prompt),
+    { timeoutMs: foundationConfig.answerTimeoutMs }
   );
 
   if (!answer.trim()) {
@@ -953,6 +1282,11 @@ async function extractLocationsFromKnowledgeAnswer(
 }
 
 async function extractLocationsFromPrompt(prompt: string): Promise<CityResult[]> {
+  const knownLocations = extractKnownLocationsFromPrompt(prompt);
+  if (knownLocations.length > 0) {
+    return knownLocations;
+  }
+
   const rawText = await createChatText(
     getFoundationClient(),
     foundationConfig.model,
@@ -1010,6 +1344,97 @@ async function tryResolvePromptThroughRagflow(
   }
 }
 
+async function resolvePromptOptimized(
+  prompt: string,
+  useKnowledgeBase: boolean,
+  timer: RequestTimer
+): Promise<ExtractQueryResponse> {
+  const rawLocationsPromise = timed(timer, "location extraction", () =>
+    extractLocationsFromPrompt(prompt)
+  ).catch((error) => {
+    console.warn("[qiaoqing] Location extraction failed:", getErrorMessage(error));
+    return [] as CityResult[];
+  });
+  const locationsPromise = withSoftTimeout(
+    rawLocationsPromise,
+    locationExtractionSoftTimeoutMs,
+    [] as CityResult[],
+    () => {
+      timer.mark("location extraction soft timeout", {
+        ms: locationExtractionSoftTimeoutMs,
+      });
+    }
+  );
+
+  if (useKnowledgeBase && isRagflowEnabled()) {
+    const foundationFallback = createDeferredFoundationFallback(prompt, timer);
+    const answerPromise = timed(timer, "ragflow answer", () =>
+      answerGeneralWithRagflow(prompt)
+    ).catch((error) => {
+      console.warn("[qiaoqing] RAGFlow answer failed:", getErrorMessage(error));
+      return null;
+    });
+
+    const [locations, ragflowAnswer] = await Promise.all([
+      locationsPromise,
+      answerPromise,
+    ]);
+
+    if (ragflowAnswer) {
+      foundationFallback.cancel();
+      timer.mark("compose ragflow response", {
+        locations: locations.length,
+      });
+      return buildQueryResponse(
+        attachAnswerToCities(locations, ragflowAnswer, "ragflow"),
+        ragflowAnswer,
+        "ragflow"
+      );
+    }
+
+    timer.mark("fallback to foundation answer", {
+      locations: locations.length,
+    });
+    const foundationAnswer = await foundationFallback.start("ragflow-miss");
+
+    if (foundationAnswer) {
+      return buildQueryResponse(
+        attachAnswerToCities(locations, foundationAnswer, "model"),
+        foundationAnswer,
+        "model"
+      );
+    }
+
+    const timeoutAnswer = buildFoundationUnavailableAnswer(true);
+    return buildQueryResponse(
+      attachAnswerToCities(locations, timeoutAnswer, "model"),
+      timeoutAnswer,
+      "model"
+    );
+  }
+
+  const answerPromise = timed(timer, "foundation answer", () =>
+    answerGeneralWithFoundation(prompt)
+  );
+  const [locations, foundationAnswer] = await Promise.all([
+    locationsPromise,
+    answerPromise,
+  ]);
+
+  if (foundationAnswer) {
+    timer.mark("compose foundation response", {
+      locations: locations.length,
+    });
+    return buildQueryResponse(
+      attachAnswerToCities(locations, foundationAnswer, "model"),
+      foundationAnswer,
+      "model"
+    );
+  }
+
+  return buildQueryResponse(locations);
+}
+
 function buildFoundationFollowupMessages(
   cityName: string,
   question: string,
@@ -1045,20 +1470,26 @@ async function answerWithRagflow(
     return null;
   }
 
-  const sessionId = await createRagflowSession(
-    `map-${cityName}-${Date.now()}`
-  );
-  const data = await requestRagflow<RagflowCompletionData>(
-    `/api/v1/chats/${ragflowConfig.chatId}/completions`,
-    {
-      method: "POST",
-      body: JSON.stringify({
-        question: buildRagflowQuestion(cityName, userPrompt, contextInfo),
-        session_id: sessionId,
-        stream: false,
-      }),
-    }
-  );
+  const cacheKey = `city:${cityName}`;
+  const sessionId = await getRagflowSession(cacheKey, `map-${cityName}`);
+  let data: RagflowCompletionData;
+
+  try {
+    data = await requestRagflow<RagflowCompletionData>(
+      `/api/v1/chats/${ragflowConfig.chatId}/completions`,
+      {
+        method: "POST",
+        body: JSON.stringify({
+          question: buildRagflowQuestion(cityName, userPrompt, contextInfo),
+          session_id: sessionId,
+          stream: false,
+        }),
+      }
+    );
+  } catch (error) {
+    invalidateRagflowSession(cacheKey);
+    throw error;
+  }
 
   const answer =
     typeof data.answer === "string" ? buildAnswerText(data.answer) : null;
@@ -3927,6 +4358,7 @@ async function startServer() {
   });
 
   app.post("/api/extractCities", async (req, res) => {
+    const timer = createRequestTimer("qiaoqing.ask");
     try {
       const prompt = typeof req.body?.prompt === "string" ? req.body.prompt.trim() : "";
       const useKnowledgeBase = readKnowledgeBasePreference(
@@ -3935,6 +4367,17 @@ async function startServer() {
 
       if (!prompt) {
         return res.status(400).json({ error: "Prompt is required" });
+      }
+
+      const cacheKey = getQueryCacheKey(prompt, useKnowledgeBase);
+      const cachedResponse = readCachedQueryResponse(cacheKey);
+      if (cachedResponse) {
+        timer.mark("cache hit", {
+          locations: cachedResponse.locations.length,
+          source: cachedResponse.source ?? "unknown",
+        });
+        timer.end("respond cached");
+        return res.json(cachedResponse);
       }
 
       const auditUser = await readSessionAdminUser(req);
@@ -3947,57 +4390,23 @@ async function startServer() {
           useKnowledgeBase,
         },
       });
+      timer.mark("audit recorded");
 
-      const ragflowResolvedCities = await tryResolvePromptThroughRagflow(
+      const responsePayload = await resolvePromptOptimized(
         prompt,
-        useKnowledgeBase
+        useKnowledgeBase,
+        timer
       );
-      if (ragflowResolvedCities) {
-        return res.json(ragflowResolvedCities);
-      }
+      writeCachedQueryResponse(cacheKey, responsePayload);
+      timer.mark("cache write", {
+        locations: responsePayload.locations.length,
+        source: responsePayload.source ?? "unknown",
+      });
+      timer.end("respond fresh");
 
-      const rawText = await createChatText(
-        getFoundationClient(),
-        foundationConfig.model,
-        buildCityExtractionMessages(prompt)
-      );
-
-      const cities = parseCityResults(rawText);
-      const shouldUseGeneralKnowledgeFirst =
-        cities.length === 0 ||
-        cities.every((city) => isSuspiciousExtractedLocation(city.name));
-
-      if (shouldUseGeneralKnowledgeFirst) {
-        const foundationResolvedCities = await resolvePromptThroughFoundation(prompt);
-        if (foundationResolvedCities) {
-          return res.json(foundationResolvedCities);
-        }
-      }
-
-      if (cities.length === 0) {
-        return res.json(buildQueryResponse([]));
-      }
-
-      const enrichedCities = await Promise.all(
-        cities.map((city) =>
-          enrichCityWithKnowledge(city, prompt, useKnowledgeBase)
-        )
-      );
-
-      const hasKnowledgeHit = enrichedCities.some((city) => city.source === "ragflow");
-      const allExtractedCitiesAreSuspicious = enrichedCities.every((city) =>
-        isSuspiciousExtractedLocation(city.name)
-      );
-
-      if (!hasKnowledgeHit && allExtractedCitiesAreSuspicious) {
-        const foundationResolvedCities = await resolvePromptThroughFoundation(prompt);
-        if (foundationResolvedCities) {
-          return res.json(foundationResolvedCities);
-        }
-      }
-
-      return res.json(buildQueryResponse(enrichedCities));
+      return res.json(responsePayload);
     } catch (error) {
+      timer.end("failed");
       console.error("Extract cities API error:", error);
       return res.status(getStatusCode(error)).json({
         error: "Failed to extract cities",

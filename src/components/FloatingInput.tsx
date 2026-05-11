@@ -1,5 +1,5 @@
-import React, { useEffect, useRef, useState } from 'react';
-import { Loader2, Mic, Volume2, VolumeX, X } from 'lucide-react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
+import { Activity, Loader2, Mic, Volume2, VolumeX, X } from 'lucide-react';
 import { motion } from 'motion/react';
 import { UiTheme } from '../lib/ui';
 
@@ -11,7 +11,15 @@ interface FloatingInputProps {
   cityCount: number;
   isVoiceEnabled: boolean;
   onToggleVoice: () => void;
+  isKnowledgeBaseEnabled: boolean;
   theme: UiTheme;
+}
+
+interface ProgressStep {
+  at: number;
+  progress: number;
+  title: string;
+  detail: string;
 }
 
 export default function FloatingInput({
@@ -22,18 +30,86 @@ export default function FloatingInput({
   cityCount,
   isVoiceEnabled,
   onToggleVoice,
+  isKnowledgeBaseEnabled,
   theme,
 }: FloatingInputProps) {
   const [input, setInput] = useState('');
   const [isListening, setIsListening] = useState(false);
   const [hasSpeechSupport, setHasSpeechSupport] = useState(false);
+  const [progressValue, setProgressValue] = useState(0);
+  const [progressStepIndex, setProgressStepIndex] = useState(0);
   const recognitionRef = useRef<any>(null);
   const inputRef = useRef('');
   const onSearchRef = useRef(onSearch);
 
+  const progressSteps = useMemo<ProgressStep[]>(
+    () => [
+      {
+        at: 0,
+        progress: 10,
+        title: '提交问题',
+        detail: '正在发送侨情监测请求',
+      },
+      {
+        at: 900,
+        progress: 28,
+        title: '识别地点',
+        detail: '抽取问题中的国家、城市或区域',
+      },
+      {
+        at: 2200,
+        progress: 54,
+        title: isKnowledgeBaseEnabled ? '查询知识库' : '调用大模型',
+        detail: isKnowledgeBaseEnabled ? '正在检索侨情资料与引用片段' : '正在生成基础地理回答',
+      },
+      {
+        at: 5200,
+        progress: 76,
+        title: '整理回答',
+        detail: '清理引用标记并组织地图信息卡',
+      },
+      {
+        at: 8200,
+        progress: 92,
+        title: '同步地图',
+        detail: '等待服务端返回，准备点亮地图位置',
+      },
+    ],
+    [isKnowledgeBaseEnabled]
+  );
+
   useEffect(() => {
     onSearchRef.current = onSearch;
   }, [onSearch]);
+
+  useEffect(() => {
+    if (!isLoading) {
+      setProgressValue(0);
+      setProgressStepIndex(0);
+      return;
+    }
+
+    const startedAt = Date.now();
+    const timer = window.setInterval(() => {
+      const elapsed = Date.now() - startedAt;
+      const nextStepIndex = progressSteps.reduce(
+        (activeIndex, step, index) => (elapsed >= step.at ? index : activeIndex),
+        0
+      );
+      const step = progressSteps[nextStepIndex];
+      const nextStep = progressSteps[nextStepIndex + 1];
+      const segmentDuration = Math.max((nextStep?.at ?? step.at + 3600) - step.at, 1);
+      const segmentRatio = Math.min(Math.max((elapsed - step.at) / segmentDuration, 0), 0.86);
+      const segmentTarget = nextStep?.progress ?? 96;
+      const easedRatio = 1 - Math.pow(1 - segmentRatio, 2);
+      const nextProgress = step.progress + (segmentTarget - step.progress) * easedRatio;
+
+      setProgressStepIndex(nextStepIndex);
+      setProgressValue(Math.min(nextProgress, 96));
+    }, 220);
+
+    return () => window.clearInterval(timer);
+  }, [isLoading, progressSteps]);
 
   const handleSetInput = (value: string) => {
     setInput(value);
@@ -111,6 +187,7 @@ export default function FloatingInput({
       : 'text-[#e2e8f0] placeholder:text-white/30';
   const rightIconClass =
     theme === 'light' ? 'text-slate-500 hover:text-slate-700' : 'text-white/50 hover:text-white';
+  const activeProgressStep = progressSteps[progressStepIndex] ?? progressSteps[0];
 
   return (
     <motion.div
@@ -196,6 +273,43 @@ export default function FloatingInput({
             )}
           </button>
         </form>
+
+        {isLoading && (
+          <motion.div
+            initial={{ opacity: 0, y: -6 }}
+            animate={{ opacity: 1, y: 0 }}
+            exit={{ opacity: 0, y: -6 }}
+            className={`mt-4 rounded-xl border px-3.5 py-3 ${
+              theme === 'light'
+                ? 'border-emerald-200 bg-white/62 text-slate-700'
+                : 'border-[#4ade80]/20 bg-[#4ade80]/8 text-white/76'
+            }`}
+          >
+            <div className="mb-2 flex items-center justify-between gap-3">
+              <div className="flex min-w-0 items-center gap-2">
+                <Activity className="h-3.5 w-3.5 shrink-0 text-[#4ade80]" />
+                <span className="truncate text-xs font-medium">{activeProgressStep.title}</span>
+              </div>
+              <span className="text-[11px] tabular-nums text-[#4ade80]">
+                {Math.round(progressValue)}%
+              </span>
+            </div>
+            <div
+              className={`h-1.5 overflow-hidden rounded-full ${
+                theme === 'light' ? 'bg-slate-200/80' : 'bg-white/10'
+              }`}
+            >
+              <motion.div
+                className="h-full rounded-full bg-[#4ade80] shadow-[0_0_12px_rgba(74,222,128,0.7)]"
+                animate={{ width: `${progressValue}%` }}
+                transition={{ duration: 0.22, ease: 'easeOut' }}
+              />
+            </div>
+            <p className={`mt-2 text-[11px] leading-relaxed ${descClass}`}>
+              {activeProgressStep.detail}
+            </p>
+          </motion.div>
+        )}
 
         {hasResults && (
           <div className={`mt-5 text-xs leading-[1.8] ${theme === 'light' ? 'text-slate-700' : 'text-white/70'}`}>
