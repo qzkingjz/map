@@ -11,6 +11,7 @@ import AiMapExperience from './components/AiMapExperience';
 import AdminDashboard from './components/AdminDashboard';
 import LatestNewsPage from './components/LatestNewsPage';
 import LoginPage from './components/LoginPage';
+import QiaoqingAssistantPage from './components/QiaoqingAssistantPage';
 import QuanzhouExhibitMap, { MigrationPoint } from './components/QuanzhouExhibitMap';
 import heritageNanyangImage from './assets/heritage-nanyang.png';
 import { AdminUser, getCurrentAdmin, logoutAdmin, recordPageView } from './lib/adminApi';
@@ -106,6 +107,7 @@ export default function App() {
   const [route, setRoute] = useState(window.location.pathname);
   const [authUser, setAuthUser] = useState<AdminUser | null>(null);
   const [authStatus, setAuthStatus] = useState<'checking' | 'authenticated' | 'anonymous'>('checking');
+  const isAssistantPreviewRoute = route === '/assistant-preview' && import.meta.env.DEV;
 
   useEffect(() => {
     const handlePopState = () => setRoute(window.location.pathname);
@@ -145,7 +147,7 @@ export default function App() {
     let isActive = true;
 
     async function checkSession() {
-      if (route === '/login') {
+      if (route === '/login' || isAssistantPreviewRoute) {
         setAuthStatus('anonymous');
         return;
       }
@@ -193,6 +195,9 @@ export default function App() {
     if (route === '/latest') {
       void recordPageView('最新侨情', route);
     }
+    if (route === '/assistant') {
+      void recordPageView('侨情助手', route);
+    }
   }, [authStatus, route, view]);
 
   if (route === '/login') {
@@ -210,6 +215,10 @@ export default function App() {
         onBackHome={() => navigate('/login')}
       />
     );
+  }
+
+  if (isAssistantPreviewRoute) {
+    return <QiaoqingAssistantPage onBack={() => navigate('/login')} />;
   }
 
   if (authStatus === 'checking' || !authUser) {
@@ -238,6 +247,10 @@ export default function App() {
     return <LatestNewsPage onBack={() => navigate('/')} />;
   }
 
+  if (route === '/assistant') {
+    return <QiaoqingAssistantPage onBack={() => navigate('/')} />;
+  }
+
   if (view === 'map') {
     return <AiMapExperience onBack={() => setView('exhibit')} />;
   }
@@ -264,6 +277,9 @@ export default function App() {
           </a>
           <button type="button" onClick={() => navigate('/latest')}>
             最新侨情
+          </button>
+          <button type="button" onClick={() => navigate('/assistant')}>
+            侨情助手
           </button>
           <button type="button" onClick={() => setView('map')}>
             侨情监测

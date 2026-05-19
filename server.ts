@@ -37,10 +37,20 @@ interface ExtractQueryResponse {
 interface AnswerText {
   clean: string;
   withReferences: string;
+  references?: SourceReference[];
+}
+
+interface SourceReference {
+  id?: string;
+  title: string;
+  excerpt?: string;
+  score?: number;
+  documentId?: string;
+  datasetId?: string;
 }
 
 type ChatMessage = OpenAI.Chat.Completions.ChatCompletionMessageParam;
-type CollectionSourceType = "crawler" | "tavily" | "bing" | "gdelt" | "rss";
+type CollectionSourceType = "aggregate" | "crawler" | "tavily" | "bing" | "gdelt" | "rss";
 type CollectionSourceMode = "auto" | "crawler" | "tavily";
 
 interface RagflowEnvelope<T> {
@@ -55,6 +65,35 @@ interface RagflowSessionData {
 
 interface RagflowCompletionData {
   answer?: string;
+  reference?: RagflowReferenceData;
+  references?: RagflowReferenceData;
+}
+
+interface RagflowReferenceData {
+  chunks?: RagflowReferenceChunk[];
+  doc_aggs?: RagflowDocumentAggregate[];
+}
+
+interface RagflowReferenceChunk {
+  id?: string | number;
+  content?: string;
+  document_name?: string;
+  doc_name?: string;
+  document_title?: string;
+  document_id?: string;
+  doc_id?: string;
+  dataset_id?: string;
+  similarity?: number;
+  vector_similarity?: number;
+  term_similarity?: number;
+}
+
+interface RagflowDocumentAggregate {
+  doc_name?: string;
+  document_name?: string;
+  doc_id?: string;
+  document_id?: string;
+  count?: number;
 }
 
 interface QueryCacheEntry {
@@ -83,6 +122,20 @@ interface GdeltArticle {
   socialimage?: string;
   content?: string;
   raw_content?: string | null;
+}
+
+interface CollectionSourceResult {
+  sourceType: CollectionSourceType;
+  articles: GdeltArticle[];
+  elapsedMs: number;
+  error?: string;
+  timedOut?: boolean;
+  skipped?: boolean;
+}
+
+interface CollectionSourceHealth {
+  failures: number;
+  disabledUntil: number;
 }
 
 interface CrawlerSource {
@@ -229,6 +282,13 @@ const newsSearchConfig = {
     process.env.BING_NEWS_SEARCH_ENDPOINT?.trim() ||
     "https://api.bing.microsoft.com/v7.0/news/search",
   market: process.env.BING_NEWS_SEARCH_MARKET?.trim() || "zh-CN",
+  crawlerTimeoutMs: Number(process.env.COLLECTION_CRAWLER_TIMEOUT_MS ?? 10_000),
+  tavilyTimeoutMs: Number(process.env.COLLECTION_TAVILY_TIMEOUT_MS ?? 8_000),
+  bingTimeoutMs: Number(process.env.COLLECTION_BING_TIMEOUT_MS ?? 8_000),
+  gdeltTimeoutMs: Number(process.env.COLLECTION_GDELT_TIMEOUT_MS ?? 7_000),
+  rssTimeoutMs: Number(process.env.COLLECTION_RSS_TIMEOUT_MS ?? 7_000),
+  sourceFailureThreshold: Number(process.env.COLLECTION_SOURCE_FAILURE_THRESHOLD ?? 3),
+  sourceCooldownMs: Number(process.env.COLLECTION_SOURCE_COOLDOWN_MS ?? 10 * 60 * 1000),
 };
 
 const dataCleaningConfig = {
@@ -373,6 +433,7 @@ const ragflowSessionReuseEnabled =
 const ragflowSessionTtlMs = Number(process.env.RAGFLOW_SESSION_TTL_MS ?? 30 * 60 * 1000);
 const queryResponseCache = new Map<string, QueryCacheEntry>();
 const ragflowSessionCache = new Map<string, RagflowSessionCacheEntry>();
+const collectionSourceHealth = new Map<CollectionSourceType, CollectionSourceHealth>();
 
 function cloneQueryResponse(value: ExtractQueryResponse): ExtractQueryResponse {
   return JSON.parse(JSON.stringify(value)) as ExtractQueryResponse;
@@ -864,12 +925,95 @@ function normalizeAnswerText(value: string): string {
     .trim();
 }
 
-function buildAnswerText(value: string): AnswerText {
+function normalizeReferenceExcerpt(value: string): string {
+  return stripReferenceNoise(value)
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 220);
+}
+
+function getReferenceTitle(
+  chunk: RagflowReferenceChunk,
+  docAggs: RagflowDocumentAggregate[]
+): string {
+  const directTitle =
+    chunk.document_name?.trim() ||
+    chunk.doc_name?.trim() ||
+    chunk.document_title?.trim();
+
+  if (directTitle) {
+    return directTitle;
+  }
+
+  const chunkDocumentId = chunk.document_id ?? chunk.doc_id;
+  const matchedAgg = docAggs.find((item) => {
+    const aggregateDocumentId = item.document_id ?? item.doc_id;
+    return aggregateDocumentId && aggregateDocumentId === chunkDocumentId;
+  });
+
+  return (
+    matchedAgg?.document_name?.trim() ||
+    matchedAgg?.doc_name?.trim() ||
+    "知识库文档"
+  );
+}
+
+function buildRagflowReferences(
+  reference?: RagflowReferenceData
+): SourceReference[] {
+  const chunks = Array.isArray(reference?.chunks) ? reference.chunks : [];
+  const docAggs = Array.isArray(reference?.doc_aggs) ? reference.doc_aggs : [];
+  const seen = new Set<string>();
+
+  return chunks
+    .map((chunk, index): SourceReference | null => {
+      const title = getReferenceTitle(chunk, docAggs);
+      const excerpt =
+        typeof chunk.content === "string"
+          ? normalizeReferenceExcerpt(chunk.content)
+          : undefined;
+      const referenceId =
+        chunk.id !== undefined && chunk.id !== null
+          ? String(chunk.id)
+          : String(index + 1);
+      const key = `${title}|${excerpt ?? ""}|${chunk.document_id ?? chunk.doc_id ?? ""}`;
+
+      if (seen.has(key)) {
+        return null;
+      }
+
+      seen.add(key);
+
+      return {
+        id: referenceId,
+        title,
+        excerpt,
+        score:
+          typeof chunk.similarity === "number"
+            ? chunk.similarity
+            : typeof chunk.vector_similarity === "number"
+              ? chunk.vector_similarity
+              : typeof chunk.term_similarity === "number"
+                ? chunk.term_similarity
+                : undefined,
+        documentId: chunk.document_id ?? chunk.doc_id,
+        datasetId: chunk.dataset_id,
+      };
+    })
+    .filter((reference): reference is SourceReference => Boolean(reference))
+    .slice(0, 6);
+}
+
+function buildAnswerText(
+  value: string,
+  reference?: RagflowReferenceData
+): AnswerText {
   const withReferences = normalizeAnswerText(value);
 
   return {
     clean: cleanRagflowAnswer(withReferences),
     withReferences,
+    references: buildRagflowReferences(reference),
   };
 }
 
@@ -1014,6 +1158,25 @@ function buildGeneralFoundationAnswerMessages(prompt: string): ChatMessage[] {
         "请直接回答用户的完整问题，不要先拆词。",
         "如果问题涉及分布、人口、迁移、热点区域，请明确写出国家、地区或城市名称，方便地图定位。",
         "回答使用简洁中文，控制在 3-6 句。",
+        "只返回纯文本，不要 Markdown。",
+      ].join(" "),
+    },
+    {
+      role: "user",
+      content: prompt,
+    },
+  ];
+}
+
+function buildAssistantFoundationAnswerMessages(prompt: string): ChatMessage[] {
+  return [
+    {
+      role: "system",
+      content: [
+        "你是海丝侨情与侨务治理垂直大模型门户网的侨情助手。",
+        "请围绕华侨华人、侨批档案、侨务治理、海外社团、泉州侨乡文化、海丝迁徙和侨商产业等主题回答。",
+        "如果问题超出侨情领域，也可以给出通用回答，但要提醒用户可补充侨情背景。",
+        "回答使用简体中文，结构清楚，控制在 3-6 句。",
         "只返回纯文本，不要 Markdown。",
       ].join(" "),
     },
@@ -1232,7 +1395,52 @@ async function answerGeneralWithRagflow(prompt: string): Promise<AnswerText | nu
   }
 
   const answer =
-    typeof data.answer === "string" ? buildAnswerText(data.answer) : null;
+    typeof data.answer === "string"
+      ? buildAnswerText(data.answer, data.reference ?? data.references)
+      : null;
+
+  if (!answer || isRagflowKnowledgeMiss(answer.withReferences)) {
+    return null;
+  }
+
+  return answer;
+}
+
+async function answerAssistantWithRagflow(
+  message: string,
+  conversationId: string
+): Promise<AnswerText | null> {
+  if (!isRagflowEnabled()) {
+    return null;
+  }
+
+  const safeConversationId =
+    conversationId.replace(/[^\w-]/g, "").slice(0, 72) || "default";
+  const cacheKey = `assistant:${safeConversationId}`;
+  const sessionId = await getRagflowSession(cacheKey, "qiaoqing-assistant");
+  let data: RagflowCompletionData;
+
+  try {
+    data = await requestRagflow<RagflowCompletionData>(
+      `/api/v1/chats/${ragflowConfig.chatId}/completions`,
+      {
+        method: "POST",
+        body: JSON.stringify({
+          question: message.trim(),
+          session_id: sessionId,
+          stream: false,
+        }),
+      }
+    );
+  } catch (error) {
+    invalidateRagflowSession(cacheKey);
+    throw error;
+  }
+
+  const answer =
+    typeof data.answer === "string"
+      ? buildAnswerText(data.answer, data.reference ?? data.references)
+      : null;
 
   if (!answer || isRagflowKnowledgeMiss(answer.withReferences)) {
     return null;
@@ -1248,6 +1456,23 @@ async function answerGeneralWithFoundation(
     getFoundationClient(),
     foundationConfig.model,
     buildGeneralFoundationAnswerMessages(prompt),
+    { timeoutMs: foundationConfig.answerTimeoutMs }
+  );
+
+  if (!answer.trim()) {
+    return null;
+  }
+
+  return buildAnswerText(answer);
+}
+
+async function answerAssistantWithFoundation(
+  prompt: string
+): Promise<AnswerText | null> {
+  const answer = await createChatText(
+    getFoundationClient(),
+    foundationConfig.model,
+    buildAssistantFoundationAnswerMessages(prompt),
     { timeoutMs: foundationConfig.answerTimeoutMs }
   );
 
@@ -1492,7 +1717,9 @@ async function answerWithRagflow(
   }
 
   const answer =
-    typeof data.answer === "string" ? buildAnswerText(data.answer) : null;
+    typeof data.answer === "string"
+      ? buildAnswerText(data.answer, data.reference ?? data.references)
+      : null;
 
   if (!answer || isRagflowKnowledgeMiss(answer.withReferences)) {
     return null;
@@ -2143,6 +2370,27 @@ function keywordTerms(keyword: string): string[] {
     .filter((item) => item.length >= 2);
 }
 
+function collectionRelatedTerms(keyword: string): string[] {
+  const normalized = keyword.replace(/\s+/g, "");
+  const terms = ["侨情", "华侨", "侨胞", "侨联", "侨务", "华侨华人"];
+
+  if (/泉州|刺桐|海丝/.test(normalized)) {
+    terms.push("泉州侨乡", "海丝侨务");
+  }
+
+  if (/菲律宾|马来西亚|新加坡|印尼|印度尼西亚|泰国|缅甸|越南|东南亚|南洋/.test(normalized)) {
+    terms.push("同乡会", "侨团", "闽南");
+  }
+
+  return [...new Set(terms.filter((term) => !normalized.includes(term)))];
+}
+
+function buildCollectionSearchQuery(keyword: string): string {
+  const relatedTerms = collectionRelatedTerms(keyword).slice(0, 8);
+  if (relatedTerms.length === 0) return keyword;
+  return `${keyword} (${relatedTerms.join(" OR ")})`;
+}
+
 function matchesKeyword(value: string, keyword: string): boolean {
   const terms = keywordTerms(keyword);
   if (terms.length === 0) return true;
@@ -2572,7 +2820,7 @@ async function fetchGdeltArticles(
   timeRangeDays: number,
   maxRecords: number
 ): Promise<GdeltArticle[]> {
-  const query = encodeURIComponent(keyword);
+  const query = encodeURIComponent(buildCollectionSearchQuery(keyword));
   const url =
     `https://api.gdeltproject.org/api/v2/doc/doc?query=${query}` +
     `&mode=ArtList&format=json&sort=DateDesc&timespan=${timeRangeDays}d` +
@@ -2605,7 +2853,7 @@ async function fetchBingNewsArticles(
 
   const freshness = timeRangeDays <= 1 ? "Day" : timeRangeDays <= 7 ? "Week" : "Month";
   const url = new URL(newsSearchConfig.bingEndpoint);
-  url.searchParams.set("q", keyword);
+  url.searchParams.set("q", buildCollectionSearchQuery(keyword));
   url.searchParams.set("mkt", newsSearchConfig.market);
   url.searchParams.set("freshness", freshness);
   url.searchParams.set("count", String(maxRecords));
@@ -2673,7 +2921,7 @@ async function fetchTavilyNewsArticles(
       "User-Agent": "qiaoqing-map-collector/1.0",
     },
     body: JSON.stringify({
-      query: `${keyword} 国内 中文 新闻 侨务 侨联 华侨 华人`,
+      query: `${buildCollectionSearchQuery(keyword)} 国内 中文 新闻`,
       topic: newsSearchConfig.tavilyTopic,
       search_depth: newsSearchConfig.tavilySearchDepth,
       max_results: Math.min(Math.max(maxRecords, 1), 20),
@@ -2738,7 +2986,7 @@ async function fetchGoogleNewsRssArticles(
   timeRangeDays: number,
   maxRecords: number
 ): Promise<GdeltArticle[]> {
-  const query = encodeURIComponent(`${keyword} when:${timeRangeDays}d`);
+  const query = encodeURIComponent(`${buildCollectionSearchQuery(keyword)} when:${timeRangeDays}d`);
   const url = `https://news.google.com/rss/search?q=${query}&hl=zh-CN&gl=CN&ceid=CN:zh-Hans`;
   const response = await fetchWithRetry(url, {
     headers: {
@@ -2768,13 +3016,282 @@ async function fetchGoogleNewsRssArticles(
   return filterChineseDomesticArticles(items);
 }
 
+function collectionSourceWeight(sourceType: CollectionSourceType): number {
+  if (sourceType === "crawler") return 50;
+  if (sourceType === "bing") return 34;
+  if (sourceType === "tavily") return 30;
+  if (sourceType === "gdelt") return 24;
+  if (sourceType === "rss") return 22;
+  return 20;
+}
+
+function trustedDomainWeight(article: GdeltArticle): number {
+  const domain = normalizeNewsDomain(article.url ?? article.domain);
+  if (!domain) return 0;
+
+  const matchedDomain = Object.keys(sourceNameByDomain).find((item) =>
+    domain === item || domain.endsWith(`.${item}`)
+  );
+
+  if (!matchedDomain) return 0;
+  if (
+    ["chinaqw.com", "qz.fjsen.com", "qzwb.com", "qztv.cn", "hqu.edu.cn"].includes(
+      matchedDomain
+    )
+  ) {
+    return 24;
+  }
+  return 16;
+}
+
+function normalizeCollectionUrl(value?: string): string | undefined {
+  if (!value) return undefined;
+
+  try {
+    const url = new URL(value);
+    url.hash = "";
+    for (const key of [...url.searchParams.keys()]) {
+      if (/^(utm_|spm|from|source|share|scene|wd|eqid)/i.test(key)) {
+        url.searchParams.delete(key);
+      }
+    }
+    return url.toString().replace(/\/$/, "");
+  } catch {
+    return value.trim().replace(/\/$/, "");
+  }
+}
+
+function normalizeCollectionTitle(value?: string): string {
+  return (value ?? "")
+    .replace(/[^\u3400-\u9fffA-Za-z0-9]/g, "")
+    .toLowerCase();
+}
+
+function titleSimilarity(left?: string, right?: string): number {
+  const a = normalizeCollectionTitle(left);
+  const b = normalizeCollectionTitle(right);
+  if (!a || !b) return 0;
+  if (a === b) return 1;
+
+  const shorter = a.length <= b.length ? a : b;
+  const longer = a.length > b.length ? a : b;
+  if (shorter.length >= 8 && longer.includes(shorter)) return 0.92;
+
+  const aTerms = new Set(keywordTerms(a));
+  const bTerms = new Set(keywordTerms(b));
+  if (aTerms.size === 0 || bTerms.size === 0) return 0;
+
+  let overlap = 0;
+  for (const term of aTerms) {
+    if (bTerms.has(term)) overlap += 1;
+  }
+  return overlap / Math.max(aTerms.size, bTerms.size);
+}
+
+function collectionArticleScore(
+  article: GdeltArticle,
+  keyword: string,
+  sourceType: CollectionSourceType
+): number {
+  const searchable = `${article.title ?? ""}\n${article.content ?? ""}`;
+  const terms = keywordTerms(keyword);
+  const matchedTerms = terms.filter((term) => searchable.includes(term)).length;
+  const keywordScore = terms.length > 0 ? (matchedTerms / terms.length) * 26 : 12;
+  const freshnessDate = parseGdeltDate(article.seendate);
+  const ageDays = freshnessDate
+    ? Math.max(0, (Date.now() - freshnessDate.getTime()) / 86_400_000)
+    : 30;
+  const freshnessScore = Math.max(0, 18 - Math.min(ageDays, 30) * 0.6);
+  const contentScore = article.raw_content || article.content ? 8 : 0;
+
+  return (
+    collectionSourceWeight(sourceType) +
+    trustedDomainWeight(article) +
+    keywordScore +
+    freshnessScore +
+    contentScore
+  );
+}
+
+function disabledCollectionSourceMessage(sourceType: CollectionSourceType): string | null {
+  const health = collectionSourceHealth.get(sourceType);
+  if (!health || health.disabledUntil <= Date.now()) return null;
+
+  const seconds = Math.ceil((health.disabledUntil - Date.now()) / 1000);
+  return `${sourceType} temporarily disabled for ${seconds}s`;
+}
+
+function recordCollectionSourceHealth(result: CollectionSourceResult): void {
+  if (result.skipped) return;
+
+  if (!result.error && !result.timedOut) {
+    collectionSourceHealth.delete(result.sourceType);
+    return;
+  }
+
+  const current = collectionSourceHealth.get(result.sourceType) ?? {
+    failures: 0,
+    disabledUntil: 0,
+  };
+  const failures = current.failures + 1;
+  const disabledUntil =
+    failures >= newsSearchConfig.sourceFailureThreshold
+      ? Date.now() + newsSearchConfig.sourceCooldownMs
+      : current.disabledUntil;
+
+  collectionSourceHealth.set(result.sourceType, {
+    failures,
+    disabledUntil,
+  });
+}
+
+async function runCollectionSource(
+  sourceType: CollectionSourceType,
+  label: string,
+  timeoutMs: number,
+  run: () => Promise<GdeltArticle[]>
+): Promise<CollectionSourceResult> {
+  const disabledMessage = disabledCollectionSourceMessage(sourceType);
+  if (disabledMessage) {
+    return {
+      sourceType,
+      articles: [],
+      elapsedMs: 0,
+      error: disabledMessage,
+      skipped: true,
+    };
+  }
+
+  const startedAt = Date.now();
+  const timeoutResult = new Promise<CollectionSourceResult>((resolve) => {
+    setTimeout(() => {
+      resolve({
+        sourceType,
+        articles: [],
+        elapsedMs: Date.now() - startedAt,
+        error: `${label} timed out after ${timeoutMs}ms`,
+        timedOut: true,
+      });
+    }, timeoutMs);
+  });
+
+  const runResult = run()
+    .then((articles): CollectionSourceResult => ({
+      sourceType,
+      articles,
+      elapsedMs: Date.now() - startedAt,
+    }))
+    .catch((error): CollectionSourceResult => ({
+      sourceType,
+      articles: [],
+      elapsedMs: Date.now() - startedAt,
+      error: getErrorMessage(error),
+    }));
+
+  return Promise.race([runResult, timeoutResult]);
+}
+
+function mergeCollectionResults(
+  results: CollectionSourceResult[],
+  keyword: string,
+  maxRecords: number
+): GdeltArticle[] {
+  type Candidate = GdeltArticle & { collectionSourceType: CollectionSourceType; score: number };
+
+  const byUrl = new Map<string, Candidate>();
+  const candidates: Candidate[] = [];
+
+  for (const result of results) {
+    for (const article of result.articles) {
+      const title = article.title?.trim();
+      const url = normalizeCollectionUrl(article.url);
+      if (!title || !url) continue;
+
+      const candidate: Candidate = {
+        ...article,
+        url,
+        collectionSourceType: result.sourceType,
+        score: collectionArticleScore(article, keyword, result.sourceType),
+      };
+      const existing = byUrl.get(url);
+      if (!existing || candidate.score > existing.score) {
+        byUrl.set(url, candidate);
+      }
+    }
+  }
+
+  const urlDeduped = [...byUrl.values()].sort((a, b) => b.score - a.score);
+  for (const article of urlDeduped) {
+    const duplicateByTitle = candidates.some(
+      (existing) => titleSimilarity(existing.title, article.title) >= 0.9
+    );
+    if (duplicateByTitle) continue;
+
+    candidates.push(article);
+    if (candidates.length >= maxRecords) break;
+  }
+
+  return candidates.map(({ collectionSourceType: _sourceType, score: _score, ...article }) => article);
+}
+
 async function fetchCollectionArticles(
   keyword: string,
   timeRangeDays: number,
   maxRecords: number,
   sourceMode: CollectionSourceMode
 ): Promise<{ sourceType: CollectionSourceType; articles: GdeltArticle[] }> {
-  if (sourceMode === "auto" || sourceMode === "crawler") {
+  if (sourceMode === "auto") {
+    const sourceRuns: Array<Promise<CollectionSourceResult>> = [
+      runCollectionSource("crawler", "Crawler", newsSearchConfig.crawlerTimeoutMs, () =>
+        fetchCrawlerArticles(keyword, timeRangeDays, maxRecords)
+      ),
+      runCollectionSource("gdelt", "GDELT", newsSearchConfig.gdeltTimeoutMs, () =>
+        fetchGdeltArticles(keyword, timeRangeDays, maxRecords)
+      ),
+      runCollectionSource("rss", "Google News RSS", newsSearchConfig.rssTimeoutMs, () =>
+        fetchGoogleNewsRssArticles(keyword, timeRangeDays, maxRecords)
+      ),
+    ];
+
+    if (newsSearchConfig.tavilyApiKey) {
+      sourceRuns.push(
+        runCollectionSource("tavily", "Tavily", newsSearchConfig.tavilyTimeoutMs, () =>
+          fetchTavilyNewsArticles(keyword, timeRangeDays, maxRecords)
+        )
+      );
+    }
+
+    if (newsSearchConfig.bingApiKey) {
+      sourceRuns.push(
+        runCollectionSource("bing", "Bing News", newsSearchConfig.bingTimeoutMs, () =>
+          fetchBingNewsArticles(keyword, timeRangeDays, maxRecords)
+        )
+      );
+    }
+
+    const results = await Promise.all(sourceRuns);
+    for (const result of results) {
+      recordCollectionSourceHealth(result);
+      const status = result.skipped
+        ? "skipped"
+        : result.timedOut
+          ? "timeout"
+          : result.error
+            ? "failed"
+            : "ok";
+      console.log(
+        `[collection] ${result.sourceType} ${status}: ${result.articles.length} articles in ${result.elapsedMs}ms` +
+          (result.error ? ` (${result.error})` : "")
+      );
+    }
+
+    return {
+      sourceType: "aggregate",
+      articles: mergeCollectionResults(results, keyword, maxRecords),
+    };
+  }
+
+  if (sourceMode === "crawler") {
     try {
       const crawlerArticles = await fetchCrawlerArticles(keyword, timeRangeDays, maxRecords);
       if (crawlerArticles.length > 0) {
@@ -2789,7 +3306,7 @@ async function fetchCollectionArticles(
     }
   }
 
-  if ((sourceMode === "auto" || sourceMode === "tavily") && newsSearchConfig.tavilyApiKey) {
+  if (sourceMode === "tavily" && newsSearchConfig.tavilyApiKey) {
     try {
       const tavilyArticles = await fetchTavilyNewsArticles(keyword, timeRangeDays, maxRecords);
       if (tavilyArticles.length > 0) {
@@ -2830,7 +3347,7 @@ async function fetchCollectionArticles(
 }
 
 function preferredCollectionSourceType(): CollectionSourceType {
-  return "crawler";
+  return "aggregate";
 }
 
 function normalizeCollectionSourceMode(value: unknown): CollectionSourceMode {
@@ -2841,8 +3358,7 @@ function normalizeCollectionSourceMode(value: unknown): CollectionSourceMode {
 function preferredCollectionSourceTypeForMode(sourceMode: CollectionSourceMode): CollectionSourceType {
   if (sourceMode === "crawler") return "crawler";
   if (sourceMode === "tavily") return "tavily";
-  if (newsSearchConfig.tavilyApiKey) return "tavily";
-  return "crawler";
+  return "aggregate";
 }
 
 async function runCollectionTask(
@@ -3176,6 +3692,23 @@ async function ensureAdminBootstrap(): Promise<void> {
     await pool.execute(
       `ALTER TABLE users
        ADD COLUMN menu_permissions JSON NULL AFTER phone`
+    );
+  }
+
+  const [collectionSourceColumns] = await pool.execute<RowDataPacket[]>(
+    `SELECT COLUMN_TYPE AS columnType
+     FROM INFORMATION_SCHEMA.COLUMNS
+     WHERE TABLE_SCHEMA = DATABASE()
+       AND TABLE_NAME = 'collection_tasks'
+       AND COLUMN_NAME = 'source_type'
+     LIMIT 1`
+  );
+  const sourceColumnType = String(collectionSourceColumns[0]?.columnType ?? "");
+  if (sourceColumnType && !sourceColumnType.includes("'aggregate'")) {
+    await pool.execute(
+      `ALTER TABLE collection_tasks
+       MODIFY source_type ENUM('aggregate', 'crawler', 'tavily', 'bing', 'gdelt', 'rss', 'manual')
+       NOT NULL DEFAULT 'aggregate'`
     );
   }
 
@@ -4302,6 +4835,79 @@ async function startServer() {
       "[ragflow] RAGFLOW_ENABLED is true, but RAGFLOW_BASE_URL / RAGFLOW_API_KEY / RAGFLOW_CHAT_ID are incomplete."
     );
   }
+
+  app.post("/api/qiaoqing-assistant", async (req, res) => {
+    const timer = createRequestTimer("qiaoqing.assistant");
+
+    try {
+      const message = typeof req.body?.message === "string" ? req.body.message.trim() : "";
+      const conversationId =
+        typeof req.body?.conversationId === "string"
+          ? req.body.conversationId.trim()
+          : "";
+      const useKnowledgeBase = readKnowledgeBasePreference(
+        req.body?.useKnowledgeBase
+      );
+
+      if (!message) {
+        return res.status(400).json({ error: "Message is required" });
+      }
+
+      if (useKnowledgeBase && !isRagflowEnabled()) {
+        return res.status(503).json({
+          error: "知识库服务暂未启用",
+          details: "请确认 RAGFLOW_ENABLED、RAGFLOW_BASE_URL、RAGFLOW_API_KEY 和 RAGFLOW_CHAT_ID 配置。",
+        });
+      }
+
+      const auditUser = await readSessionAdminUser(req);
+      await writeAuditLog("qiaoqing.assistant", req, {
+        actorUserId: auditUser?.id ?? null,
+        targetType: "question",
+        targetId: "侨情助手",
+        detail: {
+          message,
+          conversationId,
+          useKnowledgeBase,
+        },
+      });
+      timer.mark("audit recorded");
+
+      const answer = await timed(timer, "assistant answer", () =>
+        useKnowledgeBase
+          ? answerAssistantWithRagflow(message, conversationId)
+          : answerAssistantWithFoundation(message)
+      );
+
+      if (!answer) {
+        timer.end("respond empty");
+        const fallbackMessage = useKnowledgeBase
+          ? "知识库暂未返回相关结果，请换个问法再试一次。"
+          : "大模型暂未返回相关结果，请换个问法再试一次。";
+        return res.json({
+          answer: fallbackMessage,
+          answerWithReferences: fallbackMessage,
+          source: useKnowledgeBase ? "ragflow" : "model",
+          references: [],
+        });
+      }
+
+      timer.end("respond fresh");
+      return res.json({
+        answer: answer.clean,
+        answerWithReferences: answer.withReferences,
+        source: useKnowledgeBase ? "ragflow" : "model",
+        references: answer.references ?? [],
+      });
+    } catch (error) {
+      timer.end("failed");
+      console.error("Qiaoqing assistant API error:", error);
+      return res.status(getStatusCode(error)).json({
+        error: "侨情助手暂时无法连接知识库",
+        details: getErrorMessage(error),
+      });
+    }
+  });
 
   app.post("/api/followupCity", async (req, res) => {
     try {

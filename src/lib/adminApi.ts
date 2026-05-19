@@ -101,7 +101,7 @@ export interface TextCleaningUploadResult extends TextCleaningPreview {
 export interface CollectionTask {
   id: number;
   keyword: string;
-  sourceType: 'crawler' | 'tavily' | 'bing' | 'gdelt' | 'rss' | 'manual';
+  sourceType: 'aggregate' | 'crawler' | 'tavily' | 'bing' | 'gdelt' | 'rss' | 'manual';
   timeRangeDays: number;
   maxRecords: number;
   status: 'pending' | 'running' | 'completed' | 'failed';

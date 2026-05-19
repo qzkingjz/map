@@ -200,6 +200,7 @@ function articleStatusText(status?: NewsArticle['status']): string {
 }
 
 function sourceTypeText(sourceType: CollectionTask['sourceType']): string {
+  if (sourceType === 'aggregate') return '智能聚合';
   if (sourceType === 'crawler') return '国内爬虫';
   if (sourceType === 'tavily') return 'Tavily';
   if (sourceType === 'bing') return 'Bing';
@@ -882,7 +883,7 @@ export default function AdminDashboard({ onRequireLogin, onBackHome }: AdminDash
                       setCollectionSourceMode(event.target.value as 'auto' | 'crawler' | 'tavily')
                     }
                   >
-                    <option value="auto">爬虫优先，Tavily备用</option>
+                    <option value="auto">智能聚合（多源并行）</option>
                     <option value="crawler">只用国内爬虫</option>
                     <option value="tavily">只用Tavily</option>
                   </select>

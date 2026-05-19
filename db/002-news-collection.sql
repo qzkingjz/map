@@ -3,7 +3,7 @@ USE qiaoqing_admin;
 CREATE TABLE IF NOT EXISTS collection_tasks (
   id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
   keyword VARCHAR(255) NOT NULL,
-  source_type ENUM('crawler', 'tavily', 'bing', 'gdelt', 'rss', 'manual') NOT NULL DEFAULT 'crawler',
+  source_type ENUM('aggregate', 'crawler', 'tavily', 'bing', 'gdelt', 'rss', 'manual') NOT NULL DEFAULT 'aggregate',
   time_range_days INT UNSIGNED NOT NULL DEFAULT 7,
   max_records INT UNSIGNED NOT NULL DEFAULT 20,
   status ENUM('pending', 'running', 'completed', 'failed') NOT NULL DEFAULT 'pending',
